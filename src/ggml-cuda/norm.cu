@@ -1,4 +1,6 @@
 #include "norm.cuh"
+#include "unary.cuh"
+#include <algorithm>
 #include <cstdint>
 
 template <int block_size>
@@ -456,6 +458,341 @@ void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Parallel group norm.
+// The stock kernel above runs one block per group (grid = 32 for a VAE), i.e. ~1 block per SM, and reads x three
+// times. Here: (1) a stats kernel splits every group into up to GN_MAX_CHUNKS chunks and writes per-chunk shifted
+// sums (x - K, (x - K)^2 with K = first element of the group, so E[x^2] - E[x]^2 does not cancel), (2) an apply kernel
+// over (channel plane chunk, channel, sample) merges the chunk sums of its group in double in a fixed order, then
+// writes ((x - mean) * rstd) [* w[c]] [+ b[c]] [-> silu] with float4 loads/stores. ggml_cuda_try_fuse uses (2) to
+// fold the GROUP_NORM -> MUL(gamma) -> ADD(beta) [-> SILU] chain that ggml_ext_group_norm + ggml_silu_inplace produce.
+// Groups of <= GN_SMALL_MAX elements (UNet, small latents) instead use one block per group that holds the group in
+// registers (one read, exact two-pass mean/variance, one write).
+// All kernels are elementwise-safe when x aliases dst (stats only reads; apply reads x[i] and writes dst[i]; K is
+// saved by the stats kernel, not re-read by apply).
+// ---------------------------------------------------------------------------------------------------------------------
+
+#define GN_BLOCK      256
+#define GN_MAX_CHUNKS 64
+#define GN_MIN_CHUNK  2048
+
+template <bool vec>
+static __global__ void group_norm_stats_f32(const float * __restrict__ x, float2 * __restrict__ partials,
+                                            const int64_t group_size, const int64_t chunk, const int nchunks) {
+    const int     gi    = blockIdx.y;
+    const int     ci    = blockIdx.x;
+    const float * xg    = x + (int64_t) gi * group_size;
+    const int64_t start = (int64_t) ci * chunk;
+    const int64_t end   = min(start + chunk, group_size);
+
+    ggml_cuda_pdl_sync();
+    const float K = xg[0];
+
+    float s = 0.0f;
+    float q = 0.0f;
+    if constexpr (vec) {
+        const float4 * x4 = (const float4 *) (xg + start);
+        const int      n4 = (int) ((end - start) / 4);
+#pragma unroll 4
+        for (int i = threadIdx.x; i < n4; i += GN_BLOCK) {
+            const float4 v  = x4[i];
+            const float  d0 = v.x - K, d1 = v.y - K, d2 = v.z - K, d3 = v.w - K;
+            s += (d0 + d1) + (d2 + d3);
+            q += (d0 * d0 + d1 * d1) + (d2 * d2 + d3 * d3);
+        }
+    } else {
+        for (int64_t i = start + threadIdx.x; i < end; i += GN_BLOCK) {
+            const float d = xg[i] - K;
+            s += d;
+            q += d * d;
+        }
+    }
+
+    __shared__ float2 s_red[GN_BLOCK / WARP_SIZE];
+    const float2 r = block_reduce<block_reduce_method::SUM, GN_BLOCK>(make_float2(s, q), s_red);
+    if (threadIdx.x == 0) {
+        partials[(int64_t) gi * (nchunks + 1) + ci] = r;
+        if (ci == 0) {
+            partials[(int64_t) gi * (nchunks + 1) + nchunks] = make_float2(K, 0.0f);
+        }
+    }
+}
+
+// (mean, rstd) of a group from its chunk partials, merged in double in a fixed order; called by one full warp,
+// every lane gets the result
+static __device__ float2 group_norm_merge(const float2 * __restrict__ p, const int nchunks, const int64_t group_size,
+                                          const float eps) {
+    double S = 0.0, Q = 0.0;
+    for (int k = threadIdx.x; k < nchunks; k += WARP_SIZE) {
+        const float2 v = p[k];
+        S += v.x;
+        Q += v.y;
+    }
+#pragma unroll
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
+        S += __shfl_xor_sync(0xffffffff, S, off, WARP_SIZE);
+        Q += __shfl_xor_sync(0xffffffff, Q, off, WARP_SIZE);
+    }
+    const double m   = S / (double) group_size;
+    const double var = fmax(Q / (double) group_size - m * m, 0.0);
+    return make_float2((float) ((double) p[nchunks].x + m), rsqrtf((float) var + eps));
+}
+
+// chunks of a group for the statistics kernel: elements per chunk (a multiple of 4) and their count
+static void group_norm_chunking(const int64_t group_size, int64_t & chunk, int & nchunks) {
+    chunk   = std::max<int64_t>((group_size + GN_MAX_CHUNKS - 1) / GN_MAX_CHUNKS, GN_MIN_CHUNK);
+    chunk   = (chunk + 3) / 4 * 4;
+    nchunks = (int) ((group_size + chunk - 1) / chunk);
+}
+
+template <bool vec, bool has_w, bool has_b, bool silu>
+static __global__ void group_norm_apply_f32(const float * x, float * dst, const float2 * __restrict__ partials,
+                                            const float * __restrict__ w, const float * __restrict__ b,
+                                            const int64_t hw, const int cpg, const int ngroups, const int64_t group_size,
+                                            const int nchunks, const int64_t per_block, const float eps) {
+    const int c      = blockIdx.y;
+    const int sample = blockIdx.z;
+    const int gi     = sample * ngroups + c / cpg;
+
+    __shared__ float s_mean, s_rstd;
+
+    ggml_cuda_pdl_sync();
+    if (threadIdx.x < WARP_SIZE) {
+        const float2 ms = group_norm_merge(partials + (int64_t) gi * (nchunks + 1), nchunks, group_size, eps);
+        if (threadIdx.x == 0) {
+            s_mean = ms.x;
+            s_rstd = ms.y;
+        }
+    }
+    __syncthreads();
+
+    const float   mean = s_mean;
+    const float   rstd = s_rstd;
+    const float   wc   = has_w ? w[c] : 1.0f;
+    const float   bc   = has_b ? b[c] : 0.0f;
+    const int64_t base = ((int64_t) sample * gridDim.y + c) * hw;
+    const int64_t i0   = (int64_t) blockIdx.x * per_block;
+    const int64_t i1   = min(i0 + per_block, hw);
+
+    auto f = [&](float v) {
+        float t = (v - mean) * rstd;
+        if constexpr (has_w) {
+            t = t * wc;
+        }
+        if constexpr (has_b) {
+            t = t + bc;
+        }
+        if constexpr (silu) {
+            t = ggml_cuda_op_silu_single(t);
+        }
+        return t;
+    };
+
+    if constexpr (vec) {
+        const float4 * x4 = (const float4 *) (x + base + i0);
+        float4 *       d4 = (float4 *) (dst + base + i0);
+        const int      n4 = (int) ((i1 - i0) / 4);
+#pragma unroll 4
+        for (int i = threadIdx.x; i < n4; i += GN_BLOCK) {
+            float4 v = x4[i];
+            v.x      = f(v.x);
+            v.y      = f(v.y);
+            v.z      = f(v.z);
+            v.w      = f(v.w);
+            d4[i]    = v;
+        }
+    } else {
+        for (int64_t i = i0 + threadIdx.x; i < i1; i += GN_BLOCK) {
+            dst[base + i] = f(x[base + i]);
+        }
+    }
+}
+
+#define GN_SMALL_BLOCK 1024
+#define GN_SMALL_NV    8  // float4 per thread held in registers
+#define GN_SMALL_MAX   (4 * GN_SMALL_NV * GN_SMALL_BLOCK)  // largest group of the one-block path, 32768 elements
+
+// one block per group for small groups (UNet / VAE bottleneck): the group is read once into registers, mean and
+// centred variance are exact two-pass reductions, then the normalised (+gamma, +beta, +silu) values are written.
+template <bool has_w, bool has_b, bool silu>
+static __global__ void __launch_bounds__(GN_SMALL_BLOCK)
+group_norm_small_f32(const float * x, float * dst, const float * __restrict__ w, const float * __restrict__ b,
+                     const int hw, const int cpg, const int ngroups, const int group_size, const float eps) {
+    const int      gi = blockIdx.x;
+    const int      c0 = (gi % ngroups) * cpg;
+    const float4 * x4 = (const float4 *) (x + (int64_t) gi * group_size);
+    float4 *       d4 = (float4 *) (dst + (int64_t) gi * group_size);
+    const int      n4 = group_size / 4;
+
+    __shared__ float s_a[GN_SMALL_BLOCK / WARP_SIZE];
+    __shared__ float s_b[GN_SMALL_BLOCK / WARP_SIZE];
+
+    ggml_cuda_pdl_sync();
+    float4 v[GN_SMALL_NV];
+    float  s = 0.0f;
+#pragma unroll
+    for (int k = 0; k < GN_SMALL_NV; ++k) {
+        const int i = threadIdx.x + k * GN_SMALL_BLOCK;
+        v[k]        = i < n4 ? x4[i] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        s += (v[k].x + v[k].y) + (v[k].z + v[k].w);
+    }
+    s                = block_reduce<block_reduce_method::SUM, GN_SMALL_BLOCK>(s, s_a);
+    const float mean = s / group_size;
+
+    float q = 0.0f;
+#pragma unroll
+    for (int k = 0; k < GN_SMALL_NV; ++k) {
+        const int i = threadIdx.x + k * GN_SMALL_BLOCK;
+        if (i < n4) {
+            const float d0 = v[k].x - mean, d1 = v[k].y - mean, d2 = v[k].z - mean, d3 = v[k].w - mean;
+            q += (d0 * d0 + d1 * d1) + (d2 * d2 + d3 * d3);
+        }
+    }
+    q                = block_reduce<block_reduce_method::SUM, GN_SMALL_BLOCK>(q, s_b);
+    const float rstd = rsqrtf(q / group_size + eps);
+
+#pragma unroll
+    for (int k = 0; k < GN_SMALL_NV; ++k) {
+        const int i = threadIdx.x + k * GN_SMALL_BLOCK;
+        if (i < n4) {
+            const int   c  = c0 + (i * 4) / hw;
+            const float wc = has_w ? w[c] : 1.0f;
+            const float bc = has_b ? b[c] : 0.0f;
+            auto        f  = [&](float t) {
+                t = (t - mean) * rstd;
+                if constexpr (has_w) {
+                    t = t * wc;
+                }
+                if constexpr (has_b) {
+                    t = t + bc;
+                }
+                if constexpr (silu) {
+                    t = ggml_cuda_op_silu_single(t);
+                }
+                return t;
+            };
+            float4 r;
+            r.x   = f(v[k].x);
+            r.y   = f(v[k].y);
+            r.z   = f(v[k].z);
+            r.w   = f(v[k].w);
+            d4[i] = r;
+        }
+    }
+}
+
+template <bool has_w, bool has_b>
+static void group_norm_small_launch(bool silu, int ngi, cudaStream_t stream, const float * x, float * dst,
+                                    const float * w, const float * b, int hw, int cpg, int ngroups, int group_size,
+                                    float eps) {
+    if (silu) {
+        group_norm_small_f32<has_w, has_b, true>
+            <<<ngi, GN_SMALL_BLOCK, 0, stream>>>(x, dst, w, b, hw, cpg, ngroups, group_size, eps);
+    } else {
+        group_norm_small_f32<has_w, has_b, false>
+            <<<ngi, GN_SMALL_BLOCK, 0, stream>>>(x, dst, w, b, hw, cpg, ngroups, group_size, eps);
+    }
+}
+
+template <bool vec, bool has_w, bool has_b>
+static void group_norm_apply_launch(bool silu, dim3 grid, cudaStream_t stream, const float * x, float * dst,
+                                    const float2 * partials, const float * w, const float * b, int64_t hw, int cpg,
+                                    int ngroups, int64_t group_size, int nchunks, int64_t per_block, float eps) {
+    if (silu) {
+        group_norm_apply_f32<vec, has_w, has_b, true><<<grid, GN_BLOCK, 0, stream>>>(
+            x, dst, partials, w, b, hw, cpg, ngroups, group_size, nchunks, per_block, eps);
+    } else {
+        group_norm_apply_f32<vec, has_w, has_b, false><<<grid, GN_BLOCK, 0, stream>>>(
+            x, dst, partials, w, b, hw, cpg, ngroups, group_size, nchunks, per_block, eps);
+    }
+}
+
+// x, dst: contiguous [ne0, ne1, ne2, ne3] f32, ne2 % num_groups == 0; w, b: nullptr or ne2 contiguous f32
+static void group_norm_par_f32_cuda(ggml_backend_cuda_context & ctx, const float * x, float * dst, const float * w,
+                                    const float * b, bool silu, const int64_t * ne, int num_groups, float eps) {
+    cudaStream_t  stream     = ctx.stream();
+    const int64_t hw         = ne[0] * ne[1];
+    const int     cpg        = (int) (ne[2] / num_groups);
+    const int64_t group_size = hw * cpg;
+    const int     ngi        = (int) (num_groups * ne[3]);
+    const bool    vec        = hw % 4 == 0 && ((uintptr_t) x % 16) == 0 && ((uintptr_t) dst % 16) == 0;
+
+    if (vec && group_size <= GN_SMALL_MAX) {
+        if (w && b) {
+            group_norm_small_launch<true, true>(silu, ngi, stream, x, dst, w, b, (int) hw, cpg, num_groups,
+                                                (int) group_size, eps);
+        } else if (w) {
+            group_norm_small_launch<true, false>(silu, ngi, stream, x, dst, w, b, (int) hw, cpg, num_groups,
+                                                 (int) group_size, eps);
+        } else {
+            GGML_ASSERT(!b);
+            group_norm_small_launch<false, false>(silu, ngi, stream, x, dst, w, b, (int) hw, cpg, num_groups,
+                                                  (int) group_size, eps);
+        }
+        return;
+    }
+
+    int64_t chunk;
+    int     nchunks;
+    group_norm_chunking(group_size, chunk, nchunks);
+
+    ggml_cuda_pool_alloc<float2> partials(ctx.pool(), (size_t) ngi * (nchunks + 1));
+
+    const dim3 grid_s(nchunks, ngi, 1);
+    if (vec) {
+        group_norm_stats_f32<true><<<grid_s, GN_BLOCK, 0, stream>>>(x, partials.get(), group_size, chunk, nchunks);
+    } else {
+        group_norm_stats_f32<false><<<grid_s, GN_BLOCK, 0, stream>>>(x, partials.get(), group_size, chunk, nchunks);
+    }
+
+    const int64_t per_block = 16 * GN_BLOCK;  // elements of one channel plane per block (4 float4 per thread)
+    const dim3    grid_a((unsigned) ((hw + per_block - 1) / per_block), (unsigned) ne[2], (unsigned) ne[3]);
+
+#define GN_APPLY(V)                                                                                                  \
+    if (w && b) {                                                                                                    \
+        group_norm_apply_launch<V, true, true>(silu, grid_a, stream, x, dst, partials.get(), w, b, hw, cpg,          \
+                                               num_groups, group_size, nchunks, per_block, eps);                     \
+    } else if (w) {                                                                                                  \
+        group_norm_apply_launch<V, true, false>(silu, grid_a, stream, x, dst, partials.get(), w, b, hw, cpg,         \
+                                                num_groups, group_size, nchunks, per_block, eps);                    \
+    } else {                                                                                                         \
+        GGML_ASSERT(!b);                                                                                             \
+        group_norm_apply_launch<V, false, false>(silu, grid_a, stream, x, dst, partials.get(), w, b, hw, cpg,        \
+                                                 num_groups, group_size, nchunks, per_block, eps);                   \
+    }
+    if (vec) {
+        GN_APPLY(true)
+    } else {
+        GN_APPLY(false)
+    }
+#undef GN_APPLY
+}
+
+bool ggml_cuda_op_group_norm_fused(ggml_backend_cuda_context & ctx, const ggml_tensor * gn, const ggml_tensor * w,
+                                   const ggml_tensor * b, bool silu, ggml_tensor * dst) {
+    const ggml_tensor * src0       = gn->src[0];
+    const int           num_groups = gn->op_params[0];
+    float               eps;
+    memcpy(&eps, gn->op_params + 1, sizeof(float));
+
+    if (src0->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(src0) ||
+        !ggml_is_contiguous(dst) || !ggml_are_same_shape(src0, dst) || num_groups <= 0 ||
+        src0->ne[2] % num_groups != 0 || src0->ne[2] > 65535 || src0->ne[3] > 65535 ||
+        (int64_t) num_groups * src0->ne[3] > 65535) {
+        return false;
+    }
+    // elementwise-safe only for exact aliasing (x == dst) or disjoint buffers
+    const char * x0 = (const char *) src0->data;
+    const char * d0 = (const char *) dst->data;
+    if (x0 != d0 && x0 < d0 + ggml_nbytes(dst) && d0 < x0 + ggml_nbytes(src0)) {
+        return false;
+    }
+    group_norm_par_f32_cuda(ctx, (const float *) src0->data, (float *) dst->data,
+                            w ? (const float *) w->data : nullptr, b ? (const float *) b->data : nullptr, silu,
+                            src0->ne, num_groups, eps);
+    return true;
+}
+
 void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const float * src0_d = (const float *)src0->data;
@@ -470,6 +807,10 @@ void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     float eps;
     memcpy(&eps, dst->op_params + 1, sizeof(float));
     GGML_ASSERT(eps >= 0.0f);
+
+    if (ggml_cuda_op_group_norm_fused(ctx, dst, nullptr, nullptr, false, dst)) {
+        return;
+    }
 
     int group_size = src0->ne[0] * src0->ne[1] * ((src0->ne[2] + num_groups - 1) / num_groups);
     group_norm_f32_cuda(src0_d, dst_d, num_groups * src0->ne[3], eps, group_size, ggml_nelements(src0), stream);
