@@ -1,5 +1,6 @@
 #include "norm.cuh"
 #include "unary.cuh"
+#include "nhwc-stage.cuh"
 #include <algorithm>
 #include <cstdint>
 
@@ -766,6 +767,152 @@ static void group_norm_par_f32_cuda(ggml_backend_cuda_context & ctx, const float
         GN_APPLY(false)
     }
 #undef GN_APPLY
+}
+
+// GroupNorm apply that writes the next conv's input directly as NHWC f16 : same stats
+// kernel, same mean/rstd merge and the same per-element f32 math as group_norm_apply_f32, then the f16 rounding and
+// tile transpose of the conv's staging pass (nhwc-stage.cuh). The f32 NCHW result is never written.
+template <bool has_w, bool has_b, bool silu>
+struct gn_nhwc_op {
+    const float * mean;  // per tile row (smem)
+    const float * rstd;
+    const float * wc;
+    const float * bc;
+    __device__ __forceinline__ float operator()(int r, float v) const {
+        float t = (v - mean[r]) * rstd[r];
+        if constexpr (has_w) {
+            t = t * wc[r];
+        }
+        if constexpr (has_b) {
+            t = t + bc[r];
+        }
+        if constexpr (silu) {
+            t = ggml_cuda_op_silu_single(t);
+        }
+        return t;
+    }
+};
+
+// mean/rstd of every group, merged exactly like group_norm_apply_f32 does (one warp per group)
+static __global__ void group_norm_finalize_f32(const float2 * __restrict__ partials, float2 * __restrict__ stats,
+                                               const int64_t group_size, const int nchunks, const float eps) {
+    const int gi = blockIdx.x;
+    ggml_cuda_pdl_sync();
+    const float2 ms = group_norm_merge(partials + (int64_t) gi * (nchunks + 1), nchunks, group_size, eps);
+    if (threadIdx.x == 0) {
+        stats[gi] = ms;
+    }
+}
+
+template <bool vec, bool has_w, bool has_b, bool silu>
+static __global__ void __launch_bounds__(NHWC_THREADS)
+    group_norm_apply_nhwc_f16(const float * __restrict__ x, half * __restrict__ dst, const float2 * __restrict__ stats,
+                              const float * __restrict__ w, const float * __restrict__ b, const int C, const int W,
+                              const int64_t hw, const int cpg, const int ngroups) {
+    const int sample = blockIdx.z;
+    const int c0     = blockIdx.y * NHWC_TC;
+
+    __shared__ float s_mean[NHWC_TC], s_rstd[NHWC_TC], s_w[NHWC_TC], s_b[NHWC_TC];
+
+    ggml_cuda_pdl_sync();
+    if (threadIdx.x < NHWC_TC) {
+        const int    r  = threadIdx.x;
+        const int    c  = min(c0 + r, C - 1);
+        const float2 st = stats[sample * ngroups + c / cpg];
+        s_mean[r]       = st.x;
+        s_rstd[r]       = st.y;
+        s_w[r]          = has_w ? w[c] : 1.0f;
+        s_b[r]          = has_b ? b[c] : 0.0f;
+    }
+    __syncthreads();
+
+    const gn_nhwc_op<has_w, has_b, silu> op = { s_mean, s_rstd, s_w, s_b };
+    const nhwc_src_map m = { W, (int) (hw / W), 0, 0, hw };
+    nhwc_stage_tile<NHWC_SRC_PLAIN, vec>(x + (int64_t) sample * C * hw, dst + (int64_t) sample * C * hw, C, W, hw, c0,
+                                         (int64_t) blockIdx.x * NHWC_TP, op, m);
+}
+
+template <bool vec, bool has_w, bool has_b>
+static void group_norm_apply_nhwc_launch(bool silu, dim3 grid, cudaStream_t stream, const float * x, half * dst,
+                                         const float2 * stats, const float * w, const float * b, int C, int W,
+                                         int64_t hw, int cpg, int ngroups) {
+    if (silu) {
+        group_norm_apply_nhwc_f16<vec, has_w, has_b, true><<<grid, NHWC_THREADS, 0, stream>>>(
+            x, dst, stats, w, b, C, W, hw, cpg, ngroups);
+    } else {
+        group_norm_apply_nhwc_f16<vec, has_w, has_b, false><<<grid, NHWC_THREADS, 0, stream>>>(
+            x, dst, stats, w, b, C, W, hw, cpg, ngroups);
+    }
+}
+
+bool ggml_cuda_op_group_norm_fused_nhwc(ggml_backend_cuda_context & ctx, const ggml_tensor * gn, const ggml_tensor * w,
+                                        const ggml_tensor * b, bool silu, const ggml_tensor * dst, half * out) {
+    const ggml_tensor * src0       = gn->src[0];
+    const int           num_groups = gn->op_params[0];
+    float               eps;
+    memcpy(&eps, gn->op_params + 1, sizeof(float));
+
+    if (src0->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(src0) || !ggml_are_same_shape(src0, dst) || num_groups <= 0 ||
+        src0->ne[2] % num_groups != 0 || src0->ne[2] % 8 != 0 || (b && !w) || src0->ne[2] > INT_MAX / 2 ||
+        src0->ne[0] > INT_MAX || src0->ne[3] > 65535 || (int64_t) num_groups * src0->ne[3] > 65535 ||
+        (src0->ne[2] + NHWC_TC - 1) / NHWC_TC > 65535) {
+        return false;
+    }
+    const float * x          = (const float *) src0->data;
+    const int64_t * ne       = src0->ne;
+    const int64_t hw         = ne[0] * ne[1];
+    const int     cpg        = (int) (ne[2] / num_groups);
+    const int64_t group_size = hw * cpg;
+    const int     ngi        = (int) (num_groups * ne[3]);
+    // the same vec decision as group_norm_par_f32_cuda would make for the f32 output (it picks the stats summation)
+    const bool    vec        = hw % 4 == 0 && ((uintptr_t) x % 16) == 0 && ((uintptr_t) dst->data % 16) == 0;
+    if (vec && group_size <= GN_SMALL_MAX) {
+        return false;  // one-block-per-group kernel: small tensors, keep the f32 path
+    }
+
+    cudaStream_t stream = ctx.stream();
+    int64_t chunk;
+    int     nchunks;
+    group_norm_chunking(group_size, chunk, nchunks);
+
+    ggml_cuda_pool_alloc<float2> partials(ctx.pool(), (size_t) ngi * (nchunks + 1));
+
+    const dim3 grid_s(nchunks, ngi, 1);
+    if (vec) {
+        group_norm_stats_f32<true><<<grid_s, GN_BLOCK, 0, stream>>>(x, partials.get(), group_size, chunk, nchunks);
+    } else {
+        group_norm_stats_f32<false><<<grid_s, GN_BLOCK, 0, stream>>>(x, partials.get(), group_size, chunk, nchunks);
+    }
+
+    ggml_cuda_pool_alloc<float2> stats(ctx.pool(), (size_t) ngi);
+    group_norm_finalize_f32<<<ngi, WARP_SIZE, 0, stream>>>(partials.get(), stats.get(), group_size, nchunks, eps);
+
+    const int     C    = (int) ne[2];
+    const int     W    = (int) ne[0];
+    const float * wd   = w ? (const float *) w->data : nullptr;
+    const float * bd   = b ? (const float *) b->data : nullptr;
+    const bool    vec4 = hw % 4 == 0 && ((uintptr_t) x % 16) == 0;  // float4 loads in the tile (not numerics)
+    const dim3    grid((unsigned) ((hw + NHWC_TP - 1) / NHWC_TP), (unsigned) ((C + NHWC_TC - 1) / NHWC_TC),
+                       (unsigned) ne[3]);
+#define GN_NHWC(V)                                                                                                    \
+    if (wd && bd) {                                                                                                   \
+        group_norm_apply_nhwc_launch<V, true, true>(silu, grid, stream, x, out, stats.get(), wd, bd, C, W, hw, cpg, \
+                                                    num_groups);                            \
+    } else if (wd) {                                                                                                  \
+        group_norm_apply_nhwc_launch<V, true, false>(silu, grid, stream, x, out, stats.get(), wd, bd, C, W, hw,    \
+                                                     cpg, num_groups);                      \
+    } else {                                                                                                          \
+        group_norm_apply_nhwc_launch<V, false, false>(silu, grid, stream, x, out, stats.get(), wd, bd, C, W, hw,   \
+                                                      cpg, num_groups);                     \
+    }
+    if (vec4) {
+        GN_NHWC(true)
+    } else {
+        GN_NHWC(false)
+    }
+#undef GN_NHWC
+    return true;
 }
 
 bool ggml_cuda_op_group_norm_fused(ggml_backend_cuda_context & ctx, const ggml_tensor * gn, const ggml_tensor * w,

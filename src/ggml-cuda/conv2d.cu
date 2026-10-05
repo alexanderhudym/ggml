@@ -1,6 +1,7 @@
 #include "conv2d.cuh"
 #include "convert.cuh"
 #include "mma.cuh"
+#include "conv2d-implicit.cuh"
 
 struct conv_params {
     const int64_t IW, IH;
@@ -334,7 +335,26 @@ static void conv2d_cuda_f32(const float * X_D, const float * K_D, float * Y_D, c
     conv2d_cuda<float>(X_D, K_D, Y_D, P, st);
 }
 
-void ggml_cuda_op_conv2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+// true if the conv runs on the tensor-core implicit GEMM (conv2d-implicit.cu), which reads its input as NHWC f16:
+// NVIDIA build and device with sm_80 tensor cores, f16 filter up to 32x32, a multiple of 8 input channels, positive
+// stride and dilation, non-negative padding, 32-bit tensor sizes (param_t), batch within the staging grid
+bool ggml_cuda_conv2d_accepts_nhwc(const ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
+    const ggml_tensor * kernel = dst->src[0];
+    const ggml_tensor * input  = dst->src[1];
+    const auto &        device = ggml_cuda_info().devices[ctx.device];
+    const int32_t *     p      = (const int32_t *) dst->op_params;
+    return dst->op == GGML_OP_CONV_2D && kernel->type == GGML_TYPE_F16 && input->type == GGML_TYPE_F32 &&
+           dst->type == GGML_TYPE_F32 && ggml_is_contiguous(input) && ggml_is_contiguous(kernel) &&
+           input->ne[2] == kernel->ne[2] && p[6] == 0 && p[0] > 0 && p[1] > 0 && p[2] >= 0 && p[3] >= 0 && p[4] > 0 &&
+           p[5] > 0 && GGML_CUDA_CC_IS_NVIDIA(device.cc) && ampere_mma_available(device.cc) &&
+           input->ne[2] % 8 == 0 && kernel->ne[0] <= 32 && kernel->ne[1] <= 32 && input->ne[3] <= 65535 &&
+           ggml_nelements(input) <= INT_MAX && ggml_nelements(dst) <= INT_MAX && ggml_nelements(kernel) <= INT_MAX;
+}
+
+// Runs the conv. With bias/residual/out set it may apply the fused epilogue out = (conv + bias) + residual inside
+// the conv kernel (tensor-core path); returns true if it did, false if the plain conv result is in dst->data.
+static bool conv2d_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const float * bias = nullptr,
+                       const float * residual = nullptr, float * out = nullptr, const half * x_nhwc = nullptr) {
     const ggml_tensor * kernel = dst->src[0];
     const ggml_tensor * input  = dst->src[1];
     float *             K_D    = (float *) kernel->data;
@@ -376,6 +396,11 @@ void ggml_cuda_op_conv2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     conv_params   params = { IW, IH, OW, OH, KW, KH, ST_X, ST_Y, PD_X, PD_Y, DL_X, DL_Y, IC, OC, B, total };
 
     const auto & device = ggml_cuda_info().devices[ctx.device];
+    if (ggml_cuda_conv2d_accepts_nhwc(ctx, dst)) {
+        ggml_cuda_op_conv2d_implicit(ctx, dst, bias, residual, out, x_nhwc);
+        return out != nullptr;
+    }
+    GGML_ASSERT(!x_nhwc);
     const bool   use_mma =
         turing_mma_available(device.cc) || amd_wmma_available(device.cc) || amd_mfma_available(device.cc);
     // MUSA can share the tiling without a native fragment implementation in mma.cuh.
@@ -416,7 +441,7 @@ void ggml_cuda_op_conv2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                                           CUDA_R_16F, int(IC), &beta, Y_D + int64_t(n) * OC * positions, CUDA_R_32F,
                                           positions, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
             }
-            return;
+            return false;
         }
         const int64_t blocks  = ((OW * OH + 63) / 64) * ((OC + 63) / 64) * B;
         const int     target  = 8 * ggml_cuda_info().devices[ctx.device].nsm;
@@ -439,7 +464,7 @@ void ggml_cuda_op_conv2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             conv2d_reduce_split_k<<<(total + 255) / 256, 256, 0, st>>>(result, Y_D, int(total), int(OC * OW * OH),
                                                                        split_k);
         }
-        return;
+        return false;
     }
 
     if (kernel->type == GGML_TYPE_F16) {
@@ -447,4 +472,169 @@ void ggml_cuda_op_conv2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     } else {
         conv2d_cuda_f32(X_D, K_D, Y_D, params, st);
     }
+    return false;
+}
+
+void ggml_cuda_op_conv2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    conv2d_run(ctx, dst);
+}
+
+// ---- CONV_2D -> [RESHAPE] -> ADD(bias) [-> ADD(residual)] fusion -------------------------------------------------
+// sd.cpp builds every biased conv as ggml_add(conv, reshape(bias, [1,1,OC,1])), and ResNet blocks follow it with
+// ggml_add(h, x). The fused path does the same fp32 adds in the same order (bit-identical), either in the
+// tensor-core conv epilogue or, for the other conv paths, in one elementwise pass instead of two.
+
+static __global__ void conv2d_bias_residual(const float * x, const float * __restrict__ bias, const float * residual,
+                                            float * dst, const int64_t total, const int64_t PQ, const int64_t K) {
+    const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= total) {
+        return;
+    }
+    float v = x[i];
+    if (bias) {
+        v += bias[(i / PQ) % K];
+    }
+    if (residual) {
+        v += residual[i];
+    }
+    dst[i] = v;
+}
+
+static bool conv2d_fuse_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    const char * a0 = (const char *) a->data;
+    const char * b0 = (const char *) b->data;
+    return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+}
+
+int ggml_cuda_try_fuse_conv2d_bias(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i,
+                                   const half * x_nhwc) {
+    ggml_tensor * conv = cgraph->nodes[i];
+    if (conv->op != GGML_OP_CONV_2D || conv->type != GGML_TYPE_F32 || !ggml_is_contiguous(conv) ||
+        (conv->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, i) != 1) {
+        return 0;
+    }
+    // the bias reshape (a no-op view) usually sits between the conv and the add
+    int j = i + 1;
+    while (j < cgraph->n_nodes && j <= i + 2 && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+        ++j;
+    }
+    if (j >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * add = cgraph->nodes[j];
+    if (add->op != GGML_OP_ADD || !(add->flags & GGML_TENSOR_FLAG_COMPUTE) || add->type != GGML_TYPE_F32 ||
+        add->src[0] != conv || !ggml_are_same_shape(add, conv) || !ggml_is_contiguous(add)) {
+        return 0;
+    }
+    const ggml_tensor * bias = add->src[1];
+    const int64_t       OC   = conv->ne[2];
+    if (bias->type != GGML_TYPE_F32 || bias->ne[0] != 1 || bias->ne[1] != 1 || bias->ne[2] != OC || bias->ne[3] != 1 ||
+        bias->nb[2] != sizeof(float) || bias->data == nullptr) {
+        return 0;
+    }
+    const ggml_tensor * input  = conv->src[1];
+    const ggml_tensor * weight = conv->src[0];
+
+    // optional residual add right after: ADD(add, r) or ADD(r, add)
+    ggml_tensor *       dst      = add;
+    const ggml_tensor * residual = nullptr;
+    const int           k        = j + 1;
+    if (k < cgraph->n_nodes && !(add->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_node_get_use_count(cgraph, j) == 1) {
+        ggml_tensor *       add2 = cgraph->nodes[k];
+        const ggml_tensor * r    = nullptr;
+        if (add2->op == GGML_OP_ADD && (add2->flags & GGML_TENSOR_FLAG_COMPUTE) && add2->type == GGML_TYPE_F32) {
+            r = add2->src[0] == add ? add2->src[1] : add2->src[1] == add ? add2->src[0] : nullptr;
+        }
+        // the residual is read and dst written at the same index by the same thread, so it may alias dst exactly
+        if (r && r != add && r->type == GGML_TYPE_F32 && ggml_are_same_shape(r, add) && ggml_are_same_shape(add2, add) &&
+            ggml_is_contiguous(r) && ggml_is_contiguous(add2) && r->data != nullptr &&
+            (r->data == add2->data || !conv2d_fuse_overlap(r, add2)) && !conv2d_fuse_overlap(r, conv)) {
+            dst      = add2;
+            residual = r;
+        }
+    }
+    // the conv reads its input/weights while the epilogue writes dst: they must not share memory
+    auto dst_ok = [&](const ggml_tensor * d) {
+        return !conv2d_fuse_overlap(d, input) && !conv2d_fuse_overlap(d, weight) && !conv2d_fuse_overlap(d, bias);
+    };
+    if (!dst_ok(dst)) {
+        dst      = add;
+        residual = nullptr;
+        if (!dst_ok(dst)) {
+            return 0;
+        }
+    }
+
+    const float * b_d = (const float *) bias->data;
+    const float * r_d = residual ? (const float *) residual->data : nullptr;
+    float *       out = (float *) dst->data;
+    if (!conv2d_run(ctx, conv, b_d, r_d, out, x_nhwc)) {
+        const int64_t total = ggml_nelements(conv);
+        conv2d_bias_residual<<<(total + 255) / 256, 256, 0, ctx.stream()>>>(
+            (const float *) conv->data, b_d, r_d, out, total, conv->ne[0] * conv->ne[1], OC);
+    }
+    return (dst == add ? j : k) - i;
+}
+
+// ---- producer -> CONV_2D with the NHWC f16 input written by the producer ------------------------------------------
+// The tensor-core conv stages its f32 NCHW input as f16 NHWC in a separate pass (read 4 B + write 2 B per element).
+// When the conv is the only consumer of its input, the producer can write that layout directly:
+//  - GROUP_NORM -> MUL -> ADD [-> SILU] (ggml_cuda_try_fuse_group_norm, norm.cu's NHWC apply kernel), and
+//  - UPSCALE (nearest, exactly 2x) and PAD (zeros, W/H only) folded into the staging read (below).
+// Values are the same f32 results rounded to f16 the same way, so the conv output is bit-identical.
+
+int ggml_cuda_conv2d_run_nhwc(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i, const half * x_nhwc) {
+    const int n_fused = ggml_cuda_try_fuse_conv2d_bias(ctx, cgraph, i, x_nhwc);
+    if (n_fused > 0) {
+        return n_fused;
+    }
+    conv2d_run(ctx, cgraph->nodes[i], nullptr, nullptr, nullptr, x_nhwc);
+    return 0;
+}
+
+int ggml_cuda_try_fuse_stage_conv2d(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
+    const ggml_tensor * prod = cgraph->nodes[i];
+    const ggml_tensor * src  = prod->src[0];
+    if (src == nullptr || prod->type != GGML_TYPE_F32 || src->type != GGML_TYPE_F32 || !ggml_is_contiguous(src) ||
+        !ggml_is_contiguous(prod) || prod->ne[2] != src->ne[2] || prod->ne[3] != src->ne[3] ||
+        (prod->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, i) != 1) {
+        return 0;
+    }
+    int mode = -1, lp0 = 0, lp1 = 0;
+    if (prod->op == GGML_OP_UPSCALE) {
+        // NEAREST without flags, exactly 2x in W and H: upscale_f32 reads src(x / 2.0f, y / 2.0f) = (x / 2, y / 2)
+        if (ggml_get_op_params_i32(prod, 0) == GGML_SCALE_MODE_NEAREST && prod->ne[0] == 2 * src->ne[0] &&
+            prod->ne[1] == 2 * src->ne[1]) {
+            mode = 1;
+        }
+    } else if (prod->op == GGML_OP_PAD) {
+        const int32_t * pp = (const int32_t *) prod->op_params;  // lp0 rp0 lp1 rp1 lp2 rp2 lp3 rp3 circular
+        if (pp[0] >= 0 && pp[1] >= 0 && pp[2] >= 0 && pp[3] >= 0 && pp[4] == 0 && pp[5] == 0 && pp[6] == 0 &&
+            pp[7] == 0 && pp[8] == 0 && prod->ne[0] == src->ne[0] + pp[0] + pp[1] &&
+            prod->ne[1] == src->ne[1] + pp[2] + pp[3]) {
+            mode = 2;
+            lp0  = pp[0];
+            lp1  = pp[2];
+        }
+    }
+    if (mode < 0 || prod->ne[0] > INT_MAX / 4 || prod->ne[1] > INT_MAX / 4 || prod->ne[3] > 65535) {
+        return 0;
+    }
+    int j = i + 1;
+    while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j]) && j <= i + 2) {
+        ++j;
+    }
+    if (j >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * conv = cgraph->nodes[j];
+    if (conv->op != GGML_OP_CONV_2D || conv->src[1] != prod || !(conv->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+        !ggml_cuda_conv2d_accepts_nhwc(ctx, conv)) {
+        return 0;
+    }
+    ggml_cuda_pool_alloc<half> x_nhwc(ctx.pool(), ggml_nelements(prod));
+    ggml_cuda_conv2d_nhwc_stage((const float *) src->data, x_nhwc.get(), int(prod->ne[2]), int(prod->ne[0]),
+                                int(prod->ne[1]), int(prod->ne[3]), mode, int(src->ne[0]), int(src->ne[1]), lp0, lp1,
+                                ctx.stream());
+    return j - i + ggml_cuda_conv2d_run_nhwc(ctx, cgraph, j, x_nhwc.get());
 }

@@ -3192,11 +3192,6 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     GGML_UNUSED(backend);
 }
 
-static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
-    return ggml_is_empty(t) || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_TRANSPOSE ||
-           t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_NONE;
-}
-
 #ifdef USE_CUDA_GRAPH
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
@@ -4135,6 +4130,19 @@ static int ggml_cuda_try_fuse_group_norm(ggml_backend_cuda_context * cuda_ctx, g
         return 0;
     }
 
+    // GN chain -> CONV_2D (its only consumer) on the tensor-core path: write the conv's NHWC f16 input directly
+    const int jc = next(last);
+    if (jc < n && sole_use(last)) {
+        ggml_tensor * conv = cgraph->nodes[jc];
+        if (conv->op == GGML_OP_CONV_2D && conv->src[1] == dst && computed(conv) &&
+            ggml_cuda_conv2d_accepts_nhwc(*cuda_ctx, conv)) {
+            ggml_cuda_pool_alloc<half> x_nhwc(cuda_ctx->pool(), ggml_nelements(dst));
+            if (ggml_cuda_op_group_norm_fused_nhwc(*cuda_ctx, gn, w, b, dst != add, dst, x_nhwc.get())) {
+                return jc - i + ggml_cuda_conv2d_run_nhwc(*cuda_ctx, cgraph, jc, x_nhwc.get());
+            }
+        }
+    }
+
     if (!ggml_cuda_op_group_norm_fused(*cuda_ctx, gn, w, b, dst == add ? false : true, dst)) {
         return 0;
     }
@@ -4154,6 +4162,22 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const int skip = ggml_cuda_try_fuse_group_norm(cuda_ctx, cgraph, i);
         if (skip > 0) {
             return skip;
+        }
+    }
+
+    // upscale(nearest 2x) / pad(zeros) -> conv2d: the conv's staging pass reads the producer's input, see conv2d.cu
+    if (node->op == GGML_OP_UPSCALE || node->op == GGML_OP_PAD) {
+        const int n_fused = ggml_cuda_try_fuse_stage_conv2d(*cuda_ctx, cgraph, i);
+        if (n_fused > 0) {
+            return n_fused;
+        }
+    }
+
+    // conv2d -> add(bias) [-> add(residual)]: epilogue fusion, see conv2d.cu
+    if (node->op == GGML_OP_CONV_2D) {
+        const int n_fused = ggml_cuda_try_fuse_conv2d_bias(*cuda_ctx, cgraph, i);
+        if (n_fused > 0) {
+            return n_fused;
         }
     }
 
