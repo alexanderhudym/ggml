@@ -4072,6 +4072,75 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// GROUP_NORM -> [noop views] -> MUL(gamma) -> [noop views] -> ADD(beta) [-> SILU], as built by sd.cpp's
+// ggml_ext_group_norm + ggml_silu_inplace. The mul/add/silu are inplace (views of the group norm output), which the
+// generic ggml_can_fuse rejects; here the use counts alone guarantee nobody else reads the intermediates.
+static int ggml_cuda_try_fuse_group_norm(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    const int n    = cgraph->n_nodes;
+    auto      next = [&](int j) {
+        for (++j; j < n && ggml_cuda_is_view_or_noop(cgraph->nodes[j]); ++j) {
+        }
+        return j;
+    };
+    auto sole_use = [&](int j) {
+        return ggml_node_get_use_count(cgraph, j) == 1 && !(cgraph->nodes[j]->flags & GGML_TENSOR_FLAG_OUTPUT);
+    };
+    auto computed = [&](const ggml_tensor * t) { return (t->flags & GGML_TENSOR_FLAG_COMPUTE) != 0; };
+    auto per_channel = [](const ggml_tensor * p, const ggml_tensor * x) {
+        return p->type == GGML_TYPE_F32 && ggml_is_contiguous(p) && p->ne[0] == 1 && p->ne[1] == 1 &&
+               p->ne[2] == x->ne[2] && p->ne[3] == 1;
+    };
+
+    ggml_tensor * gn = cgraph->nodes[i];
+    const int     jm = next(i);
+    if (jm >= n || !sole_use(i)) {
+        return 0;
+    }
+    ggml_tensor * mul = cgraph->nodes[jm];
+    if (mul->op != GGML_OP_MUL || mul->src[0] != gn || !computed(mul) || !ggml_are_same_shape(mul, gn) ||
+        !per_channel(mul->src[1], gn)) {
+        return 0;
+    }
+    const int ja = next(jm);
+    if (ja >= n || !sole_use(jm)) {
+        return 0;
+    }
+    ggml_tensor * add = cgraph->nodes[ja];
+    if (add->op != GGML_OP_ADD || add->src[0] != mul || !computed(add) || !ggml_are_same_shape(add, gn) ||
+        !per_channel(add->src[1], gn)) {
+        return 0;
+    }
+
+    int           last = ja;
+    ggml_tensor * dst  = add;
+    const int     js   = next(ja);
+    if (js < n && sole_use(ja)) {
+        ggml_tensor * s = cgraph->nodes[js];
+        if (s->op == GGML_OP_UNARY && ggml_get_unary_op(s) == GGML_UNARY_OP_SILU && s->src[0] == add && computed(s) &&
+            ggml_are_same_shape(s, gn)) {
+            last = js;
+            dst  = s;
+        }
+    }
+
+    // gamma/beta must not live in the memory the kernel writes
+    const ggml_tensor * w = mul->src[1];
+    const ggml_tensor * b = add->src[1];
+    auto overlaps = [](const ggml_tensor * a, const ggml_tensor * c) {
+        const char * a0 = (const char *) a->data;
+        const char * c0 = (const char *) c->data;
+        return a0 < c0 + ggml_nbytes(c) && c0 < a0 + ggml_nbytes(a);
+    };
+    if (overlaps(w, dst) || overlaps(b, dst)) {
+        return 0;
+    }
+
+    if (!ggml_cuda_op_group_norm_fused(*cuda_ctx, gn, w, b, dst == add ? false : true, dst)) {
+        return 0;
+    }
+    return last - i;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4080,6 +4149,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_GROUP_NORM) {
+        const int skip = ggml_cuda_try_fuse_group_norm(cuda_ctx, cgraph, i);
+        if (skip > 0) {
+            return skip;
+        }
+    }
 
     if (node->op == GGML_OP_MUL) {
         ggml_cuda_moe_weighted_reduction_match match;
