@@ -739,6 +739,11 @@ typedef struct {
 } ggml_metal_kargs_conv_2d;
 
 typedef struct {
+    int32_t r0;
+    int32_t rows;
+} ggml_metal_kargs_conv_2d_chunk;
+
+typedef struct {
     uint64_t nb00;  // kernel strides
     uint64_t nb01;
     uint64_t nb02;
@@ -784,6 +789,7 @@ typedef struct {
     int32_t  KHW; // KH * KW, pre-computed on CPU to save GPU resources
     int32_t  OW;
     int32_t  OH;
+    int32_t  oh0;
 } ggml_metal_kargs_im2col;
 
 typedef struct {
