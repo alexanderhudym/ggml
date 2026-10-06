@@ -3,9 +3,23 @@
 #include "vecdotq.cuh"
 #include "mma.cuh"
 
+#include <cstddef>
+
 using namespace ggml_cuda_mma;
 
 #include "mmq.cuh"
+
+// Mixed-precision FMA (SASS FHFMA): f32 = f16*f16 + f32 with one rounding. The product of two halves is exact
+// in f32 and none of the MMQ scale products or sums can be subnormal (all are multiples of 2^-48), so this equals
+// fmaf(__half2float(a), __half2float(b), c) under -ftz as well. Compute capability 12.x only.
+#if defined(BLACKWELL_MMA_AVAILABLE)
+#define MMQ_FHFMA_AVAILABLE
+static __device__ __forceinline__ float mmq_fma_f32_f16(const half a, const half b, const float c) {
+    float d;
+    asm("fma.rn.f32.f16 %0, %1, %2, %3;" : "=f"(d) : "h"(__half_as_ushort(a)), "h"(__half_as_ushort(b)), "f"(c));
+    return d;
+}
+#endif
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q4_0_q8_1_dp4a(
         const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
@@ -379,8 +393,16 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     const int   * y_qs = (const int   *) y + 4;
     const half2 * y_dm = (const half2 *) y;
 
+#if defined(MMQ_FHFMA_AVAILABLE)
+    // The scales stay half2 and are multiplied with the mixed-precision FMA (f32 = f16*f16 + f32): the products of two
+    // halves are exact in f32, so this is bit-identical to converting them to float first, minus the conversions.
+    typedef half2 mmq_ds_t;
+#else
+    typedef float2 mmq_ds_t;
+#endif // defined(MMQ_FHFMA_AVAILABLE)
+
     tile_A   A[ntx][MMQ_TILE_NE_K/QI8_1];
-    float2 dmA[ntx][tile_C::ne/2][MMQ_TILE_NE_K/QI8_1];
+    mmq_ds_t dmA[ntx][tile_C::ne/2][MMQ_TILE_NE_K/QI8_1];
 
     const int i0 = (threadIdx.y/ntx)*rows_per_warp;
 
@@ -401,7 +423,11 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_1) {
                 const int k0 = k00 + k01;
 
+#if defined(MMQ_FHFMA_AVAILABLE)
+                dmA[n][l][k01/QI8_1] = x_dm[i*sram_stride + k0/QI8_1];
+#else
                 dmA[n][l][k01/QI8_1] = __half22float2(x_dm[i*sram_stride + k0/QI8_1]);
+#endif // defined(MMQ_FHFMA_AVAILABLE)
             }
         }
     }
@@ -411,7 +437,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 #pragma unroll
         for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_1) {
             tile_B   B;
-            float2 dsB[tile_C::ne/2];
+            mmq_ds_t dsB[tile_C::ne/2];
 
             load_generic(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K); // faster than load_ldmatrix
 
@@ -419,7 +445,11 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             for (int l = 0; l < tile_C::ne/2; ++l) {
                 const int j = j0 + tile_C::get_j(l);
 
+#if defined(MMQ_FHFMA_AVAILABLE)
+                dsB[l] = y_dm[j*MMQ_TILE_Y_K + k01/QI8_1];
+#else
                 dsB[l] = __half22float2(y_dm[j*MMQ_TILE_Y_K + k01/QI8_1]);
+#endif // defined(MMQ_FHFMA_AVAILABLE)
             }
 
 #pragma unroll
@@ -429,13 +459,155 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
 #pragma unroll
                 for (int l = 0; l < tile_C::ne; ++l) {
+#if defined(MMQ_FHFMA_AVAILABLE)
+                    float & s = sum[(j0/tile_C::J + n)*tile_C::ne + l];
+                    const float dAdB = mmq_fma_f32_f16(__low2half(dmA[n][l/2][k01/QI8_1]), __low2half(dsB[l%2]), 0.0f);
+                    s = __fmaf_rn(dAdB, (float) C.x[l], s);
+                    s = mmq_fma_f32_f16(__high2half(dmA[n][l/2][k01/QI8_1]), __high2half(dsB[l%2]), s);
+#else
                     sum[(j0/tile_C::J + n)*tile_C::ne + l] += dmA[n][l/2][k01/QI8_1].x*dsB[l%2].x*C.x[l];
                     sum[(j0/tile_C::J + n)*tile_C::ne + l] += dmA[n][l/2][k01/QI8_1].y*dsB[l%2].y;
+#endif // defined(MMQ_FHFMA_AVAILABLE)
                 }
             }
         }
     }
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+}
+
+// MMQ_PIPE_RAW (NVIDIA int8 mma, Q4_K/Q5_K): x is used straight from the raw blocks that cp.async copied into shared
+// memory (one block of 256 values per row and k iteration, row stride = block size, conflict-free for ldmatrix since
+// 144 and 176 bytes are odd multiples of 16 modulo 128). The nibbles (and Q5_K high bits) are unpacked in registers
+// after ldmatrix and the half2 scales are computed per row exactly as ggml_cuda_mmq_load_tiles_q4_K/q5_K do, so the
+// int8 operands, the scales and the accumulation are the same as with the unpacked tile -> bit-identical results.
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q45_K_raw_mma(
+        const char * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+#if defined(BLACKWELL_MMA_AVAILABLE)
+    static_assert(type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K, "bad type");
+    typedef tile<16,  8, int> tile_A;
+    typedef tile< 8,  8, int> tile_B;
+    typedef tile<16,  8, int> tile_C;
+
+    constexpr int rows_per_warp = ggml_cuda_mmq_get_rows_per_warp(type, J, fallback);
+    constexpr int ntx           = rows_per_warp/tile_C::I; // Number of x minitiles per warp.
+
+    constexpr int row_bytes = type == GGML_TYPE_Q4_K ? sizeof(block_q4_K) : sizeof(block_q5_K);
+    constexpr int qs_offset = type == GGML_TYPE_Q4_K ? offsetof(block_q4_K, qs) : offsetof(block_q5_K, qs);
+    static_assert(row_bytes % 16 == 0 && qs_offset % 16 == 0, "bad block layout");
+
+    y += (threadIdx.y % ntx) * (tile_C::J*MMQ_TILE_Y_K);
+
+    const int   * y_qs = (const int   *) y + 4;
+    const half2 * y_dm = (const half2 *) y;
+
+#if defined(MMQ_FHFMA_AVAILABLE)
+    typedef half2 mmq_ds_t;
+#else
+    typedef float2 mmq_ds_t;
+#endif // defined(MMQ_FHFMA_AVAILABLE)
+
+    tile_A   A[ntx][MMQ_TILE_NE_K/QI8_1];
+    mmq_ds_t dmA[ntx][tile_C::ne/2][MMQ_TILE_NE_K/QI8_1];
+
+    const int i0  = (threadIdx.y/ntx)*rows_per_warp;
+    const int ksc = k00 / MMQ_TILE_NE_K; // 0: sub-blocks 0..3, 1: sub-blocks 4..7
+
+#pragma unroll
+    for (int n = 0; n < ntx; ++n) {
+        const char * xrow = x + (i0 + n*tile_A::I)*row_bytes;
+
+        tile_A qh;
+        if constexpr (type == GGML_TYPE_Q5_K) {
+            load_ldmatrix(qh, (const int *) (xrow + offsetof(block_q5_K, qh)), row_bytes/sizeof(int));
+        }
+
+#pragma unroll
+        for (int cc = 0; cc < 2; ++cc) {
+            const int c = 2*ksc + cc; // chunk of 64 values = sub-blocks 2c (low nibbles) and 2c+1 (high nibbles)
+            tile_A raw;
+            load_ldmatrix(raw, (const int *) (xrow + qs_offset) + 8*c, row_bytes/sizeof(int));
+#pragma unroll
+            for (int r = 0; r < tile_A::ne; ++r) {
+                int lo = (raw.x[r] >> 0) & 0x0F0F0F0F;
+                int hi = (raw.x[r] >> 4) & 0x0F0F0F0F;
+                if constexpr (type == GGML_TYPE_Q5_K) {
+                    lo |= ((qh.x[r] >> (2*c + 0)) << 4) & 0x10101010;
+                    hi |= ((qh.x[r] >> (2*c + 1)) << 4) & 0x10101010;
+                }
+                A[n][2*cc + 0].x[r] = lo;
+                A[n][2*cc + 1].x[r] = hi;
+            }
+        }
+
+#pragma unroll
+        for (int l = 0; l < tile_C::ne/2; ++l) {
+            const int i = i0 + n*tile_A::I + tile_C::get_i(2*l);
+            const char * bxi = x + i*row_bytes;
+
+            const int * scales = (const int *) (bxi + sizeof(half2));
+            const int sc32 = unpack_scales_q45_K(scales, ksc + 0);
+            const int  m32 = unpack_scales_q45_K(scales, ksc + 2);
+
+            const uint8_t * sc8 = (const uint8_t *) &sc32;
+            const uint8_t *  m8 = (const uint8_t *)  &m32;
+
+            const half2 dm = *((const half2 *) bxi) * make_half2(1.0f, -1.0f);
+
+#pragma unroll
+            for (int kk = 0; kk < MMQ_TILE_NE_K/QI8_1; ++kk) {
+#if defined(MMQ_FHFMA_AVAILABLE)
+                dmA[n][l][kk] = dm*make_half2(sc8[kk], m8[kk]);
+#else
+                dmA[n][l][kk] = __half22float2(dm*make_half2(sc8[kk], m8[kk]));
+#endif // defined(MMQ_FHFMA_AVAILABLE)
+            }
+        }
+    }
+
+#pragma unroll
+    for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
+#pragma unroll
+        for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_1) {
+            tile_B   B;
+            mmq_ds_t dsB[tile_C::ne/2];
+
+            load_generic(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K); // faster than load_ldmatrix
+
+#pragma unroll
+            for (int l = 0; l < tile_C::ne/2; ++l) {
+                const int j = j0 + tile_C::get_j(l);
+
+#if defined(MMQ_FHFMA_AVAILABLE)
+                dsB[l] = y_dm[j*MMQ_TILE_Y_K + k01/QI8_1];
+#else
+                dsB[l] = __half22float2(y_dm[j*MMQ_TILE_Y_K + k01/QI8_1]);
+#endif // defined(MMQ_FHFMA_AVAILABLE)
+            }
+
+#pragma unroll
+            for (int n = 0; n < ntx; ++n) {
+                tile_C C;
+                mma(C, A[n][k01/QI8_1], B);
+
+#pragma unroll
+                for (int l = 0; l < tile_C::ne; ++l) {
+#if defined(MMQ_FHFMA_AVAILABLE)
+                    float & s = sum[(j0/tile_C::J + n)*tile_C::ne + l];
+                    const float dAdB = mmq_fma_f32_f16(__low2half(dmA[n][l/2][k01/QI8_1]), __low2half(dsB[l%2]), 0.0f);
+                    s = __fmaf_rn(dAdB, (float) C.x[l], s);
+                    s = mmq_fma_f32_f16(__high2half(dmA[n][l/2][k01/QI8_1]), __high2half(dsB[l%2]), s);
+#else
+                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += dmA[n][l/2][k01/QI8_1].x*dsB[l%2].x*C.x[l];
+                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += dmA[n][l/2][k01/QI8_1].y*dsB[l%2].y;
+#endif // defined(MMQ_FHFMA_AVAILABLE)
+                }
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(x, y, sum, k00);
+    NO_DEVICE_CODE;
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
 }
 
 // Used for NVFP4, Q3_K, IQ2_S, and IQ2_XS
