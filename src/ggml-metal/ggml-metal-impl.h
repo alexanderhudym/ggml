@@ -650,6 +650,15 @@ typedef struct {
 } ggml_metal_kargs_l2_norm;
 
 typedef struct {
+    int32_t D;
+    int32_t heads;
+    int32_t tokens;
+    int32_t nrows;
+    float   eps;
+    int32_t has_w;
+} ggml_metal_kargs_rms_norm_rope_pe;
+
+typedef struct {
     int64_t  ne00;
     int64_t  ne01;
     int64_t  ne02;

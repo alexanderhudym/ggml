@@ -410,6 +410,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_rope(ctx, idx);
             } break;
+        case GGML_OP_RMS_NORM_ROPE_PE:
+            {
+                n_fuse = ggml_metal_op_rms_norm_rope_pe(ctx, idx);
+            } break;
         case GGML_OP_IM2COL:
             {
                 n_fuse = ggml_metal_op_im2col(ctx, idx);
@@ -4368,6 +4372,46 @@ int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, nth, 1, 1);
 
     return n_fuse;
+}
+
+int ggml_metal_op_rms_norm_rope_pe(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * x = op->src[0];
+    const ggml_tensor * w = op->src[2];
+
+    const int64_t nrows = ggml_nrows(x);
+
+    GGML_ASSERT(nrows <= INT32_MAX);
+
+    ggml_metal_kargs_rms_norm_rope_pe args = {
+        /*.D      =*/ (int32_t) x->ne[0],
+        /*.heads  =*/ (int32_t) x->ne[1],
+        /*.tokens =*/ (int32_t) x->ne[2],
+        /*.nrows  =*/ (int32_t) nrows,
+        /*.eps    =*/ ggml_get_op_params_f32(op, 0),
+        /*.has_w  =*/ w != nullptr ? 1 : 0,
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_rms_norm_rope_pe(lib, op);
+
+    const int nsg = 4;
+
+    ggml_metal_buffer_id bid_x = ggml_metal_get_buffer_id(x);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, bid_x, 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+    ggml_metal_encoder_set_buffer  (enc, w ? ggml_metal_get_buffer_id(w) : bid_x, 3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op), 4);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, (nrows + nsg - 1)/nsg, 1, 1, 32*nsg, 1, 1);
+
+    return 1;
 }
 
 int ggml_metal_op_rope(ggml_metal_op_t ctx, int idx) {

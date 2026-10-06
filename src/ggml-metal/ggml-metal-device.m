@@ -1678,6 +1678,13 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_NORM:
         case GGML_OP_RMS_NORM:
             return has_simdgroup_reduction && (ggml_is_contiguous_rows(op->src[0]));
+        case GGML_OP_RMS_NORM_ROPE_PE:
+            return has_simdgroup_reduction &&
+                op->type == GGML_TYPE_F32 &&
+                op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) &&
+                op->src[0]->ne[0] % 32 == 0 && op->src[0]->ne[0] >= 32 && op->src[0]->ne[0] <= 256 &&
+                op->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[1]) &&
+                (op->src[2] == NULL || (op->src[2]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[2])));
         case GGML_OP_ROPE:
         case GGML_OP_ROPE_BACK:
             return true;

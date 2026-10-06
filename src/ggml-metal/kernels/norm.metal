@@ -183,6 +183,84 @@ template [[host_name("kernel_rms_norm_f32_4")]]         kernel kernel_rms_norm_f
 template [[host_name("kernel_rms_norm_mul_f32_4")]]     kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 2>;
 template [[host_name("kernel_rms_norm_mul_add_f32_4")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 3>;
 
+kernel void kernel_rms_norm_rope_pe_f32(
+        constant ggml_metal_kargs_rms_norm_rope_pe & args,
+        device const float4 * src0,
+        device const float4 * src1,
+        device const float4 * src2,
+        device       float4 * dst,
+        uint   tgpig[[threadgroup_position_in_grid]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort   nsg[[simdgroups_per_threadgroup]]) {
+#pragma METAL fp contract(off)
+    const uint row = tgpig*nsg + sgitg;
+
+    if (row >= (uint) args.nrows) {
+        return;
+    }
+
+    const uint h  = row % (uint) args.heads;
+    const uint tn = row / (uint) args.heads;
+    const uint t  = tn % (uint) args.tokens;
+    const uint n  = tn / (uint) args.tokens;
+
+    const uint D4 = args.D/4;
+
+    device const float4 * x  = src0 + (ulong) row*D4;
+    device const float4 * pe = src1 + (ulong) t*(2*D4);
+    device       float4 * y  = dst  + ((ulong) t + (ulong) args.tokens*((ulong) h + (ulong) args.heads*n))*D4;
+
+    const uint j0 = tiisg;
+    const uint j1 = tiisg + 32;
+
+    float4 x0 = 0.0f;
+    float4 x1 = 0.0f;
+
+    if (j0 < D4) {
+        x0 = x[j0];
+    }
+    if (j1 < D4) {
+        x1 = x[j1];
+    }
+
+    const float s0 = simd_sum(dot(x0, x0));
+    const float s1 = simd_sum(dot(x1, x1));
+
+    float sumf = simd_sum(tiisg == 0 ? s0 : (tiisg == 1 ? s1 : 0.0f));
+
+    const float mean  = sumf/args.D;
+    const float scale = 1.0f/sqrt(mean + args.eps);
+
+    for (uint g = 0; g < 2; ++g) {
+        const uint j = tiisg + 32*g;
+
+        if (j >= D4) {
+            break;
+        }
+
+        float4 v = (g == 0 ? x0 : x1)*scale;
+
+        if (args.has_w) {
+            v = v*src2[j];
+        }
+
+        const float4 pa = pe[2*j + 0];
+        const float4 pb = pe[2*j + 1];
+
+        const float a0 = v.x*pa.x;
+        const float a1 = v.y*pa.y;
+        const float a2 = v.x*pa.z;
+        const float a3 = v.y*pa.w;
+        const float b0 = v.z*pb.x;
+        const float b1 = v.w*pb.y;
+        const float b2 = v.z*pb.z;
+        const float b3 = v.w*pb.w;
+
+        y[j] = float4(a0 + a1, a2 + a3, b0 + b1, b2 + b3);
+    }
+}
+
 template <typename T0, typename T>
 kernel void kernel_l2_norm_impl(
         constant ggml_metal_kargs_l2_norm & args,
