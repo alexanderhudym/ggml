@@ -10,6 +10,7 @@
 #define MMQ_ITER_K             256
 #define MMQ_ITER_K_FP4         512
 #define MMQ_NWARPS               8
+#define MMQ_RASTER_L2_BYTES (int64_t(20) << 20)
 
 // Software pipelining of the MMQ main loop on consumer Blackwell (compute capability 12.x), non-FP4 types:
 //   MMQ_PIPE_XY: the two y tile halves of a k iteration are double-buffered and the raw x blocks of the next k
@@ -887,6 +888,22 @@ static constexpr __device__ ggml_cuda_mmq_write_back_t ggml_cuda_mmq_get_write_b
 
 // ---------------------------------------------------------------------------------------------
 
+// Raster order of the output tiles in the stream-k kernel (single channel/sample only, host passes group_cols >= ntx
+// otherwise): group_cols column tiles at a time with the row tiles inside a group, so that the y columns of a group
+// stay in L2 while x is streamed, instead of streaming all of y once per row tile (y does not fit into L2 for the
+// large-K matrices, e.g. K = 12288). Each tile is still computed by the same code in the same k order.
+static __device__ __forceinline__ void mmq_remap_tile(int & it, int & jt, const int ntx, const int nty, const int group_cols) {
+    if (group_cols >= ntx) {
+        return;
+    }
+    const int t  = it*ntx + jt;
+    const int g  = t / (group_cols*nty);
+    const int r  = t - g*group_cols*nty;
+    const int gc = min(group_cols, ntx - g*group_cols);
+    it = r / gc;
+    jt = g*group_cols + (r - it*gc);
+}
+
 // Size in bytes of one quantized block of src0 (0 if not supported by the MMQ pipeline).
 static constexpr __host__ __device__ int mmq_get_block_bytes(const ggml_type type) {
     switch (type) {
@@ -1188,7 +1205,7 @@ static __global__ void mul_mat_q(
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const uint3 ntx, const int pipe) {
+        const uint3 ntx, const int pipe, const int group_cols) {
 
     // Skip unused template specializations for faster compilation:
     if (ggml_cuda_mmq_get_config(type, J, fallback).type == GGML_TYPE_COUNT) {
@@ -1305,15 +1322,16 @@ static __global__ void mul_mat_q(
     while (kbc < kbc_stop && kb0_stop == int(blocks_per_ne00.z)) {
         int tmp = fastdiv(kbc, blocks_per_ne00);
         uint2 tmp2 = fast_div_modulo(tmp, ntx);
-        const int jt = tmp2.y;
+        int jt = tmp2.y;
         tmp = tmp2.x;
         tmp2 = fast_div_modulo(tmp, nchannels_y);
         const int zt = tmp2.y;
         tmp = tmp2.x;
         tmp2 = fast_div_modulo(tmp, nsamples_y);
         const int wt = tmp2.y;
-        const int it = tmp2.x;
-        
+        int it = tmp2.x;
+        mmq_remap_tile(it, jt, ntx.z, nty, group_cols);
+
         // Defaults for regular matrix multiplication:
         int col_low    = 0;
         int col_high   = ncols_dst;
@@ -1394,15 +1412,16 @@ static __global__ void mul_mat_q(
 
     int tmp = fastdiv(kbc, blocks_per_ne00);
     uint2 tmp2 = fast_div_modulo(tmp, ntx);
-    const int jt = tmp2.y;
+    int jt = tmp2.y;
     tmp = tmp2.x;
     tmp2 = fast_div_modulo(tmp, nchannels_y);
     const int zt = tmp2.y;
     tmp = tmp2.x;
     tmp2 = fast_div_modulo(tmp, nsamples_y);
     const int wt = tmp2.y;
-    const int it = tmp2.x;
-    
+    int it = tmp2.x;
+    mmq_remap_tile(it, jt, ntx.z, nty, group_cols);
+
     // Defaults for regular matrix multiplication:
     int col_low    = 0;
     int col_high   = ncols_dst;
@@ -1472,7 +1491,7 @@ static __global__ void mul_mat_q_stream_k_fixup(
         const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ expert_bounds, float * __restrict__ dst,
         float * __restrict__ tmp_last_tile, const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst,
         const int stride_col_dst, const uint3 nchannels_y, const int stride_channel_dst, const uint3 nsamples_y,
-        const int stride_sample_dst, const uint3 ntx) {
+        const int stride_sample_dst, const uint3 ntx, const int group_cols) {
     constexpr int warp_size       = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps          = (ggml_cuda_mmq_get_nthreads(type, J, fallback) / 2) / warp_size;
     constexpr int I               = ggml_cuda_mmq_get_I(type, J, fallback);
@@ -1541,15 +1560,16 @@ static __global__ void mul_mat_q_stream_k_fixup(
 
     int tmp = fastdiv(kbc0, blocks_per_ne00);
     uint2 tmp2 = fast_div_modulo(tmp, ntx);
-    const int jt = tmp2.y;
+    int jt = tmp2.y;
     tmp = tmp2.x;
     tmp2 = fast_div_modulo(tmp, nchannels_y);
     const int zt = tmp2.y;
     tmp = tmp2.x;
     tmp2 = fast_div_modulo(tmp, nsamples_y);
     const int wt = tmp2.y;
-    const int it = tmp2.x;
-    
+    int it = tmp2.x;
+    mmq_remap_tile(it, jt, ntx.z, nty, group_cols);
+
     if (!ids_dst) {
         const int offset_dst = wt*stride_sample_dst + zt*stride_channel_dst + jt*J*stride_col_dst + it*I;
         dst += offset_dst;
@@ -1686,6 +1706,16 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const int channel_ratio = args.nchannels_y / args.nchannels_x;
     const int sample_ratio  = args.nsamples_y  / args.nsamples_x;
 
+    // Tile raster (see mmq_remap_tile), compute capability 12.x only: keep the y columns of a group of column tiles
+    // within the L2 budget.
+    int group_cols = ntx;
+    {
+        const int64_t y_bytes_per_col_tile = int64_t(config.J) * args.ncols_x / QK8_1 * sizeof(block_q8_1);
+        if (blackwell_mma_available(cc) && ntzw == 1 && !args.ids_dst && y_bytes_per_col_tile*ntx > MMQ_RASTER_L2_BYTES) {
+            group_cols = std::max(int64_t(1), MMQ_RASTER_L2_BYTES / y_bytes_per_col_tile);
+        }
+    }
+
     const uint3 blocks_per_ne00_fd = init_fastdiv_values(args.ncols_x / ggml_cuda_type_traits<type>::qk);
     const uint3 ntx_fd             = init_fastdiv_values(ntx);
     const uint3 nchannels_y_fd     = init_fastdiv_values(args.nchannels_y);
@@ -1699,7 +1729,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             ntx_fd, pipe);
+             ntx_fd, pipe, group_cols);
         return;
     }
 
@@ -1728,7 +1758,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-         ntx_fd, pipe);
+         ntx_fd, pipe, group_cols);
 
     if (!fixup_needed) {
         return;
@@ -1738,7 +1768,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     mul_mat_q_stream_k_fixup<type, J, fallback><<<block_nums_fixup, block_dims_fixup, 0, stream>>>
         (args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, blocks_per_ne00_fd, args.nrows_x, args.ncols_dst,
          args.nrows_dst, nchannels_y_fd, args.stride_channel_dst, nsamples_y_fd, args.stride_sample_dst,
-         ntx_fd);
+         ntx_fd, group_cols);
 }
 
 template <ggml_type type, bool fallback>
