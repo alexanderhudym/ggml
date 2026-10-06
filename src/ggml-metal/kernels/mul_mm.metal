@@ -8,6 +8,7 @@ constant short FC_mul_mm_ne13  [[function_constant(FC_MUL_MM + 3)]];
 constant short FC_mul_mm_r2    [[function_constant(FC_MUL_MM + 4)]];
 constant short FC_mul_mm_r3    [[function_constant(FC_MUL_MM + 5)]];
 constant bool FC_mul_mm_id_amax [[function_constant(FC_MUL_MM + 6)]];
+constant bool FC_mul_mm_bias    [[function_constant(FC_MUL_MM + 7)]];
 
 // each block_q contains 16*nl weights
 #ifdef GGML_METAL_HAS_TENSOR
@@ -153,6 +154,7 @@ kernel void kernel_mul_mm(
         device const char * src0,
         device const char * src1,
         device       char * dst,
+        device const char * bias,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
@@ -205,8 +207,21 @@ kernel void kernel_mul_mm(
 
     simdgroup_float8x8 mc[8];
 
-    for (short i = 0; i < 8; i++){
-        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    if (FC_mul_mm_bias) {
+        threadgroup float * tb = (threadgroup float *) shmem + 128*sgitg;
+        for (short e = tiitg % 32; e < 128; e += 32) {
+            const int oc = r1 + 16*(sgitg >> 1) + 8*(e/64) + (e%64)/8;
+            tb[e] = oc < args.ne1 ? ((device const float *) bias)[oc] : 0.0f;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (short i = 0; i < 8; i++) {
+            simdgroup_load(mc[i], tb + 64*(i/4), 8, 0, false);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    } else {
+        for (short i = 0; i < 8; i++){
+            mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+        }
     }
 
     for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
@@ -965,3 +980,4 @@ template [[host_name("kernel_mul_mm_id_iq1_m_f16")]]   kernel mul_mm_id kernel_m
 template [[host_name("kernel_mul_mm_id_iq4_nl_f16")]]  kernel mul_mm_id kernel_mul_mm_id<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq4_nl,  2,     dequantize_iq4_nl,  float,  float4x4,  half, half2x4>;
 template [[host_name("kernel_mul_mm_id_iq4_xs_f16")]]  kernel mul_mm_id kernel_mul_mm_id<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq4_xs,  QK_NL, dequantize_iq4_xs,  float,  float4x4,  half, half2x4>;
 template [[host_name("kernel_mul_mm_id_tq2_0_f16")]]   kernel mul_mm_id kernel_mul_mm_id<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_tq2_0,   QK_NL, dequantize_tq2_0,   float,  float4x4,  half, half2x4>;
+

@@ -658,6 +658,7 @@ typedef struct {
     uint64_t nb02;
     int32_t  ngrp;
     float    eps;
+    int32_t  fuse;
 } ggml_metal_kargs_group_norm;
 
 typedef struct {
@@ -772,6 +773,8 @@ typedef struct {
     int32_t  KH;
     int32_t  KW;
     int32_t  KHW; // KH * KW, pre-computed on CPU to save GPU resources
+    int32_t  OW;
+    int32_t  OH;
 } ggml_metal_kargs_im2col;
 
 typedef struct {

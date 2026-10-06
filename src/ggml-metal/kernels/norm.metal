@@ -240,6 +240,8 @@ kernel void kernel_group_norm_f32(
         constant ggml_metal_kargs_group_norm & args,
         device const float * src0,
         device       float * dst,
+        device const float * gw,
+        device const float * gb,
         threadgroup float  * buf [[threadgroup(0)]],
         uint tgpig[[threadgroup_position_in_grid]],
         uint tpitg[[thread_position_in_threadgroup]],
@@ -292,6 +294,7 @@ kernel void kernel_group_norm_f32(
         tmp += xi * xi;
     }
 
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     tmp = simd_sum(tmp);
     if (ntg > N_SIMDWIDTH) {
         if (sgitg == 0) {
@@ -312,7 +315,29 @@ kernel void kernel_group_norm_f32(
 
     const float variance = tmp / gs;
     const float scale = 1.0f/sqrt(variance + args.eps);
-    for (int j = start; j < end; j += ntg) {
-        dst[j] *= scale;
+    if (args.fuse == 0) {
+        for (int j = start; j < end; j += ntg) {
+            dst[j] *= scale;
+        }
+    } else {
+        threadgroup_barrier(mem_flags::mem_device);
+        const int hw  = args.ne00*args.ne01;
+        const int g0  = tgpig*gs;
+        const int c0  = g0/hw;
+        const int nch = (end - g0)/hw;
+        for (int cc = 0; cc < nch; ++cc) {
+            const float wc = gw[c0 + cc];
+            const float bc = gb[c0 + cc];
+            device float * d = dst + g0 + cc*hw;
+            for (int k = tpitg; k < hw; k += ntg) {
+                float v = d[k]*scale;
+                v = v*wc;
+                v = v + bc;
+                if (args.fuse == 2) {
+                    v = v/(1.0f + exp(-v));
+                }
+                d[k] = v;
+            }
+        }
     }
 }
