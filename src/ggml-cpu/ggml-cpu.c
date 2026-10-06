@@ -2309,6 +2309,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_quantize_i8_convrot(params, tensor);
             }
             break;
+        case GGML_OP_RMS_NORM_ROPE_PE:
+            {
+                // CUDA-only op (supports_op is false here); callers must check ggml_backend_supports_op and fall back.
+                GGML_ABORT("%s is not implemented on the CPU backend", ggml_op_name(tensor->op));
+            }
         case GGML_OP_NONE:
             {
                 // nop

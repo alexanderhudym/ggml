@@ -1117,9 +1117,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "QUANTIZE_I8_CONVROT",
     "SAGE_ATTN",
     "SOL_ATTN",
+    "RMS_NORM_ROPE_PE",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1236,9 +1237,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "quantize_i8_convrot(x)",
     "sage_attn(x,y,z)",
     "sol_attn(x,y,z)",
+    "rms_norm_rope_pe(x,pe)",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5674,6 +5676,26 @@ struct ggml_tensor* ggml_sol_attn(
     result->src[2]             = v;
     const float params[]       = {scale, tau};
     ggml_set_op_params(result, params, sizeof(params));
+    return result;
+}
+
+struct ggml_tensor * ggml_rms_norm_rope_pe(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * pe,
+        float                 eps) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && ggml_is_contiguous(a) && a->ne[0] % 2 == 0);
+    GGML_ASSERT(pe->type == GGML_TYPE_F32 && ggml_is_contiguous(pe));
+    GGML_ASSERT(pe->ne[0] == 2 && pe->ne[1] == 2 && pe->ne[2] == a->ne[0] / 2 && pe->ne[3] == a->ne[2]);
+    GGML_ASSERT(w == NULL || (w->type == GGML_TYPE_F32 && ggml_is_contiguous(w) && ggml_nelements(w) == a->ne[0]));
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, a->ne[0], a->ne[2], a->ne[1] * a->ne[3]);
+    result->op     = GGML_OP_RMS_NORM_ROPE_PE;
+    result->src[0] = a;
+    result->src[1] = pe;
+    result->src[2] = w;
+    ggml_set_op_params_f32(result, 0, eps);
+    ggml_set_op_params_i32(result, 1, (int32_t) a->ne[1]);
     return result;
 }
 

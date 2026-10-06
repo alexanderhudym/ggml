@@ -606,6 +606,7 @@ extern "C" {
         GGML_OP_QUANTIZE_I8_CONVROT,
         GGML_OP_SAGE_ATTN,
         GGML_OP_SOL_ATTN,
+        GGML_OP_RMS_NORM_ROPE_PE,
 
         GGML_OP_COUNT,
     };
@@ -2538,6 +2539,18 @@ extern "C" {
         struct ggml_tensor* v,
         float scale,
         float tau);
+
+    // rms_norm(a, eps) * w (w: F32 [D] or NULL), then rotary embedding with a precomputed table, and the heads moved in
+    // front of the tokens: a contiguous F32 [D, heads, tokens, batch], pe contiguous F32 [2, 2, D/2, tokens] holding a
+    // 2x2 matrix per token and pair, [[cos, -sin], [sin, cos]] (torch order [tokens, D/2, 2 (out), 2 (in)]), applied to
+    // adjacent pairs (a[2i], a[2i+1]). Output F32 [D, tokens, heads*batch]. Same arithmetic as
+    // ggml_rms_norm -> ggml_mul -> sd.cpp Rope::apply_rope(interleaved), in one pass. CUDA only, D = 32*k <= 256.
+    GGML_API struct ggml_tensor * ggml_rms_norm_rope_pe(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * pe,
+            float                 eps);
 
     GGML_DEPRECATED(GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,
