@@ -28,6 +28,7 @@
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/sage-attn.cuh"
 #include "ggml-cuda/rope-pe.cuh"
+#include "ggml-cuda/qp-fuse.cuh"
 #include "ggml-cuda/sol-attn.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
@@ -4153,6 +4154,66 @@ static int ggml_cuda_try_fuse_group_norm(ggml_backend_cuda_context * cuda_ctx, g
     return last - i;
 }
 
+// NORM -> MUL(row) and MUL(row) -> ADD(residual), see qp-fuse.cuh. Returns the number of nodes to skip.
+static int ggml_cuda_try_fuse_qp(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    const int n    = cgraph->n_nodes;
+    auto      next = [&](int j) {
+        for (++j; j < n && ggml_cuda_is_view_or_noop(cgraph->nodes[j]); ++j) {
+        }
+        return j;
+    };
+    auto sole_use = [&](int j) {
+        return ggml_node_get_use_count(cgraph, j) == 1 && !(cgraph->nodes[j]->flags & GGML_TENSOR_FLAG_OUTPUT);
+    };
+    auto computed = [&](const ggml_tensor * t) { return (t->flags & GGML_TENSOR_FLAG_COMPUTE) != 0; };
+    auto overlaps = [](const ggml_tensor * a, const ggml_tensor * c) {
+        const char * a0 = (const char *) a->data;
+        const char * c0 = (const char *) c->data;
+        return a0 < c0 + ggml_nbytes(c) && c0 < a0 + ggml_nbytes(a);
+    };
+    auto f32 = [](const ggml_tensor * t) { return t->type == GGML_TYPE_F32; };
+    // broadcast row operand: contiguous rows of x->ne[0] values, each higher dim 1 or equal to x's
+    auto row_ok = [&](const ggml_tensor * w, const ggml_tensor * x) {
+        return f32(w) && w->nb[0] == sizeof(float) && w->ne[0] == x->ne[0] &&
+               (w->ne[1] == 1 || w->ne[1] == x->ne[1]) && (w->ne[2] == 1 || w->ne[2] == x->ne[2]) &&
+               (w->ne[3] == 1 || w->ne[3] == x->ne[3]);
+    };
+
+    ggml_tensor * a = cgraph->nodes[i];
+    const int     j = next(i);
+    if (j >= n || !sole_use(i)) {
+        return 0;
+    }
+    ggml_tensor * b = cgraph->nodes[j];
+    if (!computed(b) || !f32(a) || !f32(b) || !ggml_is_contiguous(b) || !ggml_are_same_shape(a, b)) {
+        return 0;
+    }
+
+    if (a->op == GGML_OP_NORM) {
+        const ggml_tensor * x = a->src[0];
+        if (b->op != GGML_OP_MUL || b->src[0] != a || !f32(x) || x->nb[0] != sizeof(float) || !row_ok(b->src[1], a) ||
+            overlaps(b->src[1], b)) {
+            return 0;
+        }
+        ggml_cuda_op_norm_mul_fused(*cuda_ctx, a, b->src[1], b);
+        return j - i;
+    }
+
+    if (a->op == GGML_OP_MUL && b->op == GGML_OP_ADD) {
+        const ggml_tensor * r = b->src[0] == a ? b->src[1] : (b->src[1] == a ? b->src[0] : nullptr);
+        const ggml_tensor * h = a->src[0];
+        const ggml_tensor * w = a->src[1];
+        if (r == nullptr || r == a || !f32(r) || !f32(h) || !ggml_is_contiguous(r) || !ggml_is_contiguous(h) ||
+            !ggml_are_same_shape(r, b) || !ggml_are_same_shape(h, b) || !row_ok(w, h) || overlaps(w, b) ||
+            ggml_nrows(b) > 65535) {
+            return 0;
+        }
+        ggml_cuda_op_mul_add_fused(*cuda_ctx, h, w, r, b);
+        return j - i;
+    }
+    return 0;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4208,6 +4269,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 #endif
             ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, node, fused_state_cpy);
             return nodes_to_skip;
+        }
+    }
+
+    if (node->op == GGML_OP_NORM || node->op == GGML_OP_MUL) {
+        const int skip = ggml_cuda_try_fuse_qp(cuda_ctx, cgraph, i);
+        if (skip > 0) {
+            return skip;
         }
     }
 
