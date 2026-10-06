@@ -83,7 +83,9 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
 }
 
 void ggml_cuda_mul_mat_q(
-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+        const ggml_tensor * glu) {
+    GGML_ASSERT(!glu || !ids);
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -146,12 +148,28 @@ void ggml_cuda_mul_mat_q(
             const int64_t s12 = src1->nb[2] / ts_src1;
             const int64_t s13 = src1->nb[3] / ts_src1;
             if (use_native_fp4) {
+                GGML_ASSERT(!glu); // FP4 weights quantize the activations to FP4, not q8_1
                 static constexpr size_t align_float8 = 32;
                 const bool use_aligned_float8 = ggml_cuda_is_aligned(src1, align_float8);
                 static_assert(sizeof(block_fp4_mmq) == 4 * sizeof(block_q8_1));
                 quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
                                         ne11, ne12, ne13, stream);
 
+            } else if (glu) {
+                // same pointers/offsets as ggml_cuda_op_unary_gated
+                const ggml_tensor * g0 = glu->src[0];
+                const ggml_tensor * g1 = glu->src[1];
+                const int64_t nc = g1 ? g0->ne[0] : g0->ne[0] / 2;
+                const int32_t swapped = ((const int32_t *) glu->op_params)[1];
+                const float * gate = (const float *) g0->data;
+                const float * up   = g1 ? (const float *) g1->data : (const float *) g0->data;
+                if (!g1) {
+                    gate += swapped ? nc : 0;
+                    up   += swapped ? 0 : nc;
+                }
+                GGML_ASSERT(nc == ne10 && ne12 == 1 && ne13 == 1);
+                quantize_mmq_q8_1_swiglu_cuda(gate, up, src1_q8_1.get(), src0->type, ne10, g0->nb[1] / sizeof(float),
+                                              (g1 ? g1->nb[1] : g0->nb[1]) / sizeof(float), ne10_padded, ne11, stream);
             } else {
                 quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
                                        ne11, ne12, ne13, stream);

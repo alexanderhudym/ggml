@@ -2505,6 +2505,76 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
 }
 
+// GLU(SWIGLU) [-> RESHAPE] -> MUL_MAT where the matmul takes the MMQ path: the q8_1 quantization of the matmul input
+// computes silu(gate) * up itself (bit-identical floats), so the f32 GLU output is neither written nor read again.
+// Returns the number of nodes to skip after node i (0: not fused).
+static int ggml_cuda_try_fuse_glu_mmq(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, const int i) {
+    ggml_tensor * glu = cgraph->nodes[i];
+    if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || glu->type != GGML_TYPE_F32) {
+        return 0;
+    }
+    // the GLU output (and the reshape, if any) must have exactly one use, by the next node, and not be a graph output
+    auto single_use = [&](const int idx) {
+        const ggml_tensor * n = cgraph->nodes[idx];
+        return ggml_node_get_use_count(cgraph, idx) == 1 && (n->flags & GGML_TENSOR_FLAG_OUTPUT) == 0;
+    };
+    if (glu->view_src || !single_use(i)) {
+        return 0;
+    }
+    int n_skip;
+    if (i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT && cgraph->nodes[i + 1]->src[1] == glu) {
+        n_skip = 1;
+    } else if (i + 2 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_RESHAPE && cgraph->nodes[i + 1]->src[0] == glu &&
+               single_use(i + 1) && cgraph->nodes[i + 2]->op == GGML_OP_MUL_MAT && cgraph->nodes[i + 2]->src[1] == cgraph->nodes[i + 1]) {
+        n_skip = 2;
+    } else {
+        return 0;
+    }
+    if ((cgraph->nodes[i + n_skip]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        return 0;
+    }
+    ggml_tensor * mm   = cgraph->nodes[i + n_skip];
+    ggml_tensor * src0 = mm->src[0];
+    ggml_tensor * src1 = mm->src[1];
+    if (src1 != cgraph->nodes[i + n_skip - 1] || src1->data != glu->data || !ggml_is_contiguous(glu) || !ggml_is_contiguous(src1) ||
+            src1->ne[0] != glu->ne[0] || ggml_nrows(src1) != ggml_nrows(glu) || src1->ne[2] != 1 || src1->ne[3] != 1 ||
+            src0->ne[2] != 1 || src0->ne[3] != 1 || mm->type != GGML_TYPE_F32 || !ggml_is_quantized(src0->type) ||
+            src0->buffer == nullptr || !ggml_is_contiguous(src0) ||
+            // FP4 weights quantize activations to FP4 (not q8_1); the fused q8_1 quantizer would feed them garbage
+            src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_NVFP4) {
+        return 0;
+    }
+    const ggml_tensor * g0 = glu->src[0];
+    const ggml_tensor * g1 = glu->src[1];
+    if (g0->type != GGML_TYPE_F32 || (g1 && g1->type != GGML_TYPE_F32) || !ggml_is_contiguous_1(g0) || g0->nb[0] != sizeof(float) ||
+            (g1 && (!ggml_is_contiguous_1(g1) || g1->nb[0] != sizeof(float))) || glu->ne[0] % 4 != 0 ||
+            uintptr_t(g0->data) % 16 != 0 || g0->nb[1] % 16 != 0 || (g1 && (uintptr_t(g1->data) % 16 != 0 || g1->nb[1] % 16 != 0))) {
+        return 0;
+    }
+    // the matmul must take the MMQ path in ggml_cuda_mul_mat: its decisions in the same order, each one that would
+    // route the matmul elsewhere returns 0 (the dispatch before it, ggml_cuda_compute_forward, calls it directly for
+    // MUL_MAT; the MUL_MAT fusions in ggml_cuda_try_fuse need mmvf/mmvq, a NVFP4 scale or a second MUL_MAT)
+    const int cc        = ggml_cuda_info().devices[ctx.device].cc;
+    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+    const int64_t ne11  = src1->ne[1];
+    if (ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD || src0->type == GGML_TYPE_I8) {
+        return 0;
+    }
+#ifdef GGML_CUDA_USE_CUBLASLT_FP8
+    if (ggml_cuda_should_use_fp8_matmul(ctx, src0, src1, mm)) {
+        return 0;
+    }
+#endif
+    if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE ||
+            ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11) ||
+            ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false) ||
+            ggml_cuda_should_use_mmvq(src0->type, cc, ne11) || !ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
+        return 0;
+    }
+    ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, mm, glu);
+    return n_skip;
+}
+
 // returns true when ggml_cuda_mul_mat_id takes the fallback path that requires stream synchronization
 // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
 static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int cc) {
@@ -4274,6 +4344,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (node->op == GGML_OP_NORM || node->op == GGML_OP_MUL) {
         const int skip = ggml_cuda_try_fuse_qp(cuda_ctx, cgraph, i);
+        if (skip > 0) {
+            return skip;
+        }
+    }
+
+    // SWIGLU -> MMQ: the matmul's q8_1 quantization computes the GLU itself, see ggml_cuda_try_fuse_glu_mmq
+    if (node->op == GGML_OP_GLU) {
+        const int skip = ggml_cuda_try_fuse_glu_mmq(*cuda_ctx, cgraph, i);
         if (skip > 0) {
             return skip;
         }
