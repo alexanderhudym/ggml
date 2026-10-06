@@ -92,7 +92,7 @@ kernel void kernel_im2col_win(
     device T * pdst = (device T *) dst + (uint64_t) pix*args.CHW + iic*args.KHW;
 
     for (int ikh = 0; ikh < args.KH; ++ikh) {
-        const int iih = (int) ioh*args.s1 + ikh*args.d1 - args.p1;
+        const int iih = ((int) ioh + args.oh0)*args.s1 + ikh*args.d1 - args.p1;
         const bool row_ok = iih >= 0 && iih < args.IH;
         for (int ikw = 0; ikw < args.KW; ++ikw) {
             const int iiw = (int) iow*args.s0 + ikw*args.d0 - args.p0;
@@ -128,7 +128,7 @@ kernel void kernel_im2col_tile_f16(
     for (int rr = tiitg/32; rr < NC*args.KH; rr += 8) {
         const int c   = rr / args.KH;
         const int kh  = rr - c*args.KH;
-        const int ih  = ioh*args.s1 + kh*args.d1 - args.p1;
+        const int ih  = (ioh + args.oh0)*args.s1 + kh*args.d1 - args.p1;
         const int ic  = ic0 + c;
         threadgroup half * prow = patch + rr*PWD;
         const bool ok = ic < IC && ih >= 0 && ih < args.IH;
@@ -1163,6 +1163,7 @@ kernel void kernel_conv_2d_wino_in(
         constant ggml_metal_kargs_conv_2d & args,
         device const char * src,
         device       half * V,
+        constant ggml_metal_kargs_conv_2d_chunk & chunk,
         threadgroup  half * patch [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]]) {
@@ -1172,11 +1173,12 @@ kernel void kernel_conv_2d_wino_in(
 
     const int TW = (args.OW + 1)/2;
     const int TH = (args.OH + 1)/2;
-    const int T  = args.N*TH*TW;
+    const int Tc = chunk.rows*TW;
 
     const int tx0 = tgpig.x*NT;
-    const int in  = tgpig.y / TH;
-    const int ty  = tgpig.y - in*TH;
+    const int grow = chunk.r0 + tgpig.y;
+    const int in  = grow / TH;
+    const int ty  = grow - in*TH;
     const int ic0 = tgpig.z*NC;
 
     const int iy0 = 2*ty  - args.p1;
@@ -1223,9 +1225,9 @@ kernel void kernel_conv_2d_wino_in(
             t[2][q] = d[2][q] - d[1][q];
             t[3][q] = d[1][q] - d[3][q];
         }
-        const int tt = (in*TH + ty)*TW + tx;
+        const int tt = tgpig.y*TW + tx;
         device half * v = V + (uint64_t) tt*args.IC + ic;
-        const uint64_t sxi = (uint64_t) T*args.IC;
+        const uint64_t sxi = (uint64_t) Tc*args.IC;
         for (short r = 0; r < 4; ++r) {
             v[(4*r + 0)*sxi] = (half)(t[r][0] - t[r][2]);
             v[(4*r + 1)*sxi] = (half)(t[r][1] + t[r][2]);
@@ -1273,18 +1275,19 @@ kernel void kernel_conv_2d_wino_out(
         device       char  * dst,
         device const float * bias,
         constant     int   & has_bias,
+        constant ggml_metal_kargs_conv_2d_chunk & chunk,
         uint gid[[thread_position_in_grid]]) {
     const int TW = (args.OW + 1)/2;
     const int TH = (args.OH + 1)/2;
-    const int T  = args.N*TH*TW;
-    if (gid >= (uint) T*args.OC) {
+    const int Tc = chunk.rows*TW;
+    if (gid >= (uint) Tc*args.OC) {
         return;
     }
-    const int t  = gid % T;
-    const int oc = gid / T;
+    const int tl = gid % Tc;
+    const int oc = gid / Tc;
 
-    device const float * m = M + (uint64_t) oc*T + t;
-    const uint64_t sxi = (uint64_t) args.OC*T;
+    device const float * m = M + (uint64_t) oc*Tc + tl;
+    const uint64_t sxi = (uint64_t) args.OC*Tc;
     float a[4][4];
     for (short r = 0; r < 4; ++r) {
         for (short q = 0; q < 4; ++q) {
@@ -1297,6 +1300,7 @@ kernel void kernel_conv_2d_wino_out(
         b[1][q] = a[1][q] - a[2][q] - a[3][q];
     }
 
+    const int t  = chunk.r0*TW + tl;
     const int in = t / (TH*TW);
     const int rt = t - in*TH*TW;
     const int ty = rt / TW;
