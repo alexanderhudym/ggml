@@ -68,30 +68,43 @@ kernel void kernel_cpy_t_t(
         device  const char * src0,
         device        char * dst,
         uint3   tgpig[[threadgroup_position_in_grid]],
+        uint3    tgpg[[threadgroups_per_grid]],
         ushort3 tpitg[[thread_position_in_threadgroup]],
         ushort3   ntg[[threads_per_threadgroup]]) {
-    const int32_t i03 = tgpig[2];
-    const int32_t i02 = tgpig[1];
-    const int32_t i01 = ntg[1] == 1 ? tgpig[0]%args.ne01 : tgpig[0]*ntg[1] + tpitg.y;
-    const int32_t iw0 = ntg[1] == 1 ? tgpig[0]/args.ne01 : 0;
+    const bool dst_cont = args.nb0 == sizeof(T1) && args.nb1 == args.ne0*sizeof(T1) &&
+                          args.nb2 == args.ne1*args.nb1 && args.nb3 == args.ne2*args.nb2;
 
-    if (i01 >= args.ne01) {
-        return;
-    }
+    const uint32_t nrb = (args.ne01 + ntg[1] - 1)/ntg[1];
+    const uint32_t nblocks = nrb*args.ne02*args.ne03;
 
-    const int64_t n = i03*args.ne02*args.ne01*args.ne00 + i02*args.ne01*args.ne00 + i01*args.ne00;
+    for (uint32_t b = tgpig[0]; b < nblocks; b += tgpg[0]) {
+        const uint32_t ib1 = b % nrb;
+        const uint32_t t   = b / nrb;
+        const uint32_t i02 = t % args.ne02;
+        const uint32_t i03 = t / args.ne02;
+        const int32_t  i01 = ib1*ntg[1] + tpitg.y;
+        if (i01 >= args.ne01) {
+            continue;
+        }
 
-    const int32_t i3 = n/(args.ne2*args.ne1*args.ne0);
-    const int32_t i2 = (n - i3*args.ne2*args.ne1*args.ne0)/(args.ne1*args.ne0);
-    const int32_t i1 = (n - i3*args.ne2*args.ne1*args.ne0 - i2*args.ne1*args.ne0)/args.ne0;
-    const int32_t i0 = (n - i3*args.ne2*args.ne1*args.ne0 - i2*args.ne1*args.ne0 - i1*args.ne0);
+        const int64_t n = i03*args.ne02*args.ne01*args.ne00 + i02*args.ne01*args.ne00 + i01*args.ne00;
 
-    device T1 * dst_data = (device T1 *) (dst + i3*args.nb3 + i2*args.nb2 + i1*args.nb1 + i0*args.nb0);
+        device T1 * dst_data;
+        if (dst_cont) {
+            dst_data = (device T1 *) dst + n;
+        } else {
+            const int32_t i3 = n/(args.ne2*args.ne1*args.ne0);
+            const int32_t i2 = (n - i3*args.ne2*args.ne1*args.ne0)/(args.ne1*args.ne0);
+            const int32_t i1 = (n - i3*args.ne2*args.ne1*args.ne0 - i2*args.ne1*args.ne0)/args.ne0;
+            const int32_t i0 = (n - i3*args.ne2*args.ne1*args.ne0 - i2*args.ne1*args.ne0 - i1*args.ne0);
+            dst_data = (device T1 *) (dst + i3*args.nb3 + i2*args.nb2 + i1*args.nb1 + i0*args.nb0);
+        }
 
-    for (int32_t i00 = iw0*ntg[0] + tpitg.x; i00 < args.ne00;) {
-        device const T0 * src = (device T0 *)(src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01 + i00*args.nb00);
-        dst_data[i00] = cpy_cast<T1>(src[0]);
-        break;
+        device const char * src_row = src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01;
+
+        for (int32_t i00 = tpitg.x; i00 < args.ne00; i00 += ntg[0]) {
+            dst_data[i00] = cpy_cast<T1>(*(device const T0 *)(src_row + i00*args.nb00));
+        }
     }
 }
 
