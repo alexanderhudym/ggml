@@ -37,6 +37,7 @@ bool   ggml_metal_op_conv_2d_use_im2col(const struct ggml_tensor * op);
 size_t ggml_metal_op_conv_2d_extra(const struct ggml_tensor * op);
 size_t ggml_metal_op_mul_mat_extra(const struct ggml_tensor * op, const struct ggml_metal_device_props * props);
 bool   ggml_metal_op_mul_mat_use_deq(const struct ggml_tensor * op, const struct ggml_metal_device_props * props);
+bool   ggml_metal_op_mul_mat_use_mm64(const struct ggml_tensor * op, const struct ggml_metal_device_props * props);
 size_t ggml_metal_op_mul_mat_id_extra_tpe(const struct ggml_tensor * op);
 
 // id map [n_tokens, n_expert]
