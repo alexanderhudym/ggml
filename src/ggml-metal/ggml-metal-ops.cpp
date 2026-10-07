@@ -2456,6 +2456,83 @@ int ggml_metal_op_pool_2d(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+static bool ggml_metal_op_mul_mat_use_deq(const ggml_tensor * op, const ggml_metal_device_props * props) {
+    const ggml_tensor * a = op->src[0];
+    const ggml_tensor * b = op->src[1];
+
+    switch (a->type) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            break;
+        default:
+            return false;
+    }
+
+    if (props->has_tensor || ggml_metal_op_mul_mat_use_fwht(op) || !ggml_metal_op_mul_mat_use_mm(op, props->has_simdgroup_mm)) {
+        return false;
+    }
+
+    return a->nb[0] == ggml_type_size(a->type) &&
+           b->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+           b->ne[1] >= OP_MUL_MM_DEQ_MIN_ROWS &&
+           a->ne[0] % 16 == 0 &&
+           (uint64_t) (a->ne[0]/16)*a->ne[1]*a->ne[2]*a->ne[3] <= INT32_MAX;
+}
+
+static size_t ggml_metal_op_mul_mat_deq_offs(const ggml_tensor * op) {
+    return GGML_PAD(ggml_nbytes(op), 256);
+}
+
+size_t ggml_metal_op_mul_mat_extra(const ggml_tensor * op, const ggml_metal_device_props * props) {
+    if (!ggml_metal_op_mul_mat_use_deq(op, props)) {
+        return 0;
+    }
+
+    const ggml_tensor * a = op->src[0];
+
+    return ggml_metal_op_mul_mat_deq_offs(op) - ggml_nbytes(op) + 2*(size_t) a->ne[0]*a->ne[1]*a->ne[2]*a->ne[3];
+}
+
+static void ggml_metal_op_mul_mat_deq(ggml_metal_op_t ctx, const ggml_tensor * op, ggml_metal_buffer_id bid_dst) {
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * a = op->src[0];
+
+    auto pipeline = ggml_metal_library_get_pipeline_mul_mm_deq(lib, a->type);
+
+    const int32_t  nch   = a->ne[0]/16;
+    const uint64_t total = (uint64_t) nch*a->ne[1]*a->ne[2]*a->ne[3];
+
+    ggml_metal_kargs_mul_mm_deq args = {
+        /*.ne01  =*/ (int32_t) a->ne[1],
+        /*.ne02  =*/ (int32_t) a->ne[2],
+        /*.nch   =*/ nch,
+        /*.nb01  =*/ a->nb[1],
+        /*.nb02  =*/ a->nb[2],
+        /*.nb03  =*/ a->nb[3],
+        /*.total =*/ total,
+    };
+
+    const int nth = MIN(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(a), 1);
+    ggml_metal_encoder_set_buffer  (enc, bid_dst, 2);
+    ggml_metal_encoder_dispatch_threadgroups(enc, (total + nth - 1)/nth, 1, 1, nth, 1, 1);
+
+    ggml_metal_op_concurrency_reset(ctx);
+}
+
 int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -2620,14 +2697,43 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             }
         }
 
-        auto pipeline = ggml_metal_library_get_pipeline_mul_mm(lib, op, bias != nullptr);
+        const ggml_tensor * op_mm = op;
+        ggml_tensor a16 = {};
+        ggml_tensor op16 = {};
+        ggml_metal_buffer_id bid_a = ggml_metal_get_buffer_id(op->src[0]);
+        uint64_t anb01 = nb01;
+        uint64_t anb02 = nb02;
+        uint64_t anb03 = nb03;
+
+        if (ggml_metal_op_mul_mat_use_deq(op, props_dev)) {
+            bid_a = ggml_metal_get_buffer_id(op);
+            bid_a.offs += ggml_metal_op_mul_mat_deq_offs(op);
+
+            ggml_metal_op_mul_mat_deq(ctx, op, bid_a);
+
+            a16 = *op->src[0];
+            a16.type  = GGML_TYPE_F16;
+            a16.nb[0] = sizeof(ggml_fp16_t);
+            a16.nb[1] = a16.nb[0]*ne00;
+            a16.nb[2] = a16.nb[1]*ne01;
+            a16.nb[3] = a16.nb[2]*ne02;
+            op16 = *op;
+            op16.src[0] = &a16;
+            op_mm = &op16;
+
+            anb01 = a16.nb[1];
+            anb02 = a16.nb[2];
+            anb03 = a16.nb[3];
+        }
+
+        auto pipeline = ggml_metal_library_get_pipeline_mul_mm(lib, op_mm, bias != nullptr);
 
         ggml_metal_kargs_mul_mm args = {
             /*.ne00 =*/ ne00,
             /*.ne02 =*/ ne02,
-            /*.nb01 =*/ nb01,
-            /*.nb02 =*/ nb02,
-            /*.nb03 =*/ nb03,
+            /*.nb01 =*/ anb01,
+            /*.nb02 =*/ anb02,
+            /*.nb03 =*/ anb03,
             /*.ne12 =*/ ne12,
             /*.nb10 =*/ nb10,
             /*.nb11 =*/ nb11,
@@ -2641,7 +2747,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
 
         ggml_metal_encoder_set_pipeline(enc, pipeline);
         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
-        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+        ggml_metal_encoder_set_buffer  (enc, bid_a, 1);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(bias ? bias : op), 4);
