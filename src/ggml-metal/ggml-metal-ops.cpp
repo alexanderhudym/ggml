@@ -3398,6 +3398,45 @@ size_t ggml_metal_op_flash_attn_ext_extra_idx(const ggml_tensor * op) {
     return GGML_PAD(sizeof(int32_t)*(size_t) n_kv_max_padded*ne31*ne32*ne33, 16);
 }
 
+static bool ggml_metal_op_flash_attn_ext_use_mma(const ggml_tensor * op, const ggml_metal_device_props * props) {
+    const ggml_tensor * q = op->src[0];
+    const ggml_tensor * k = op->src[1];
+    const ggml_tensor * v = op->src[2];
+
+    float max_bias;
+    float logit_softcap;
+
+    memcpy(&max_bias,      ((const int32_t *) op->op_params) + 1, sizeof(max_bias));
+    memcpy(&logit_softcap, ((const int32_t *) op->op_params) + 2, sizeof(logit_softcap));
+
+    if (!props->has_simdgroup_mm || props->has_tensor ||
+        op->src[3] || op->src[4] || max_bias != 0.0f || logit_softcap != 0.0f) {
+        return false;
+    }
+
+    if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 || op->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    if (q->ne[0] != 128 || k->ne[0] != 128 || v->ne[0] != 128 || q->ne[1] < 32) {
+        return false;
+    }
+
+    if (q->nb[0] != 4 || k->nb[0] != 2 || v->nb[0] != 2) {
+        return false;
+    }
+
+    for (int i = 1; i < 4; ++i) {
+        if (q->nb[i] % 16 != 0 || k->nb[i] % 8 != 0 || v->nb[i] % 8 != 0) {
+            return false;
+        }
+    }
+
+    return ggml_metal_get_buffer_id(q).offs % 16 == 0 &&
+           ggml_metal_get_buffer_id(k).offs % 8  == 0 &&
+           ggml_metal_get_buffer_id(v).offs % 8  == 0;
+}
+
 int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -3462,6 +3501,45 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     ggml_metal_buffer_id bid_src4 = has_sinks ? ggml_metal_get_buffer_id(op->src[4]) : bid_src0;
 
     ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(op);
+
+    if (ggml_metal_op_flash_attn_ext_use_mma(op, props_dev)) {
+        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_mma(lib);
+
+        ggml_metal_kargs_flash_attn_ext args = {};
+
+        args.ne01    = ne01;
+        args.ne02    = ne02;
+        args.ne03    = ne03;
+        args.nb01    = nb01;
+        args.nb02    = nb02;
+        args.nb03    = nb03;
+        args.ne11    = ne11;
+        args.ne_12_2 = ne12;
+        args.ne_12_3 = ne13;
+        args.nb11    = nb11;
+        args.nb12    = nb12;
+        args.nb13    = nb13;
+        args.nb21    = nb21;
+        args.nb22    = nb22;
+        args.nb23    = nb23;
+        args.ne1     = ne1;
+        args.ne2     = ne2;
+        args.ne3     = ne3;
+        args.scale   = scale;
+
+        const size_t smem = (size_t) std::max(32, 2*16)*(128 + 8)*sizeof(ggml_fp16_t);
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
+        ggml_metal_encoder_set_buffer  (enc, bid_src1, 2);
+        ggml_metal_encoder_set_buffer  (enc, bid_src2, 3);
+        ggml_metal_encoder_set_buffer  (enc, bid_dst,  4);
+        ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
+        ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + 31)/32, ne02, ne03, 32, 4, 1);
+
+        return 1;
+    }
 
     ggml_metal_buffer_id bid_pad = bid_dst;
     bid_pad.offs += ggml_nbytes(op);

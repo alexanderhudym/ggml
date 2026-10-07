@@ -1019,3 +1019,163 @@ template [[host_name("kernel_mul_mm_deq_q3_K")]] kernel mul_mm_deq_t kernel_mul_
 template [[host_name("kernel_mul_mm_deq_q4_K")]] kernel mul_mm_deq_t kernel_mul_mm_deq<block_q4_K, QK_NL, dequantize_q4_K>;
 template [[host_name("kernel_mul_mm_deq_q5_K")]] kernel mul_mm_deq_t kernel_mul_mm_deq<block_q5_K, QK_NL, dequantize_q5_K>;
 template [[host_name("kernel_mul_mm_deq_q6_K")]] kernel mul_mm_deq_t kernel_mul_mm_deq<block_q6_K, QK_NL, dequantize_q6_K>;
+
+template<short D, short BK>
+kernel void kernel_flash_attn_ext_mma(
+        constant ggml_metal_kargs_flash_attn_ext & args,
+        device const char * q,
+        device const char * k,
+        device const char * v,
+        device       char * dst,
+        threadgroup  half * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    constexpr short BQ  = 32;
+    constexpr short NT  = 128;
+    constexpr short LD  = D + 8;
+    constexpr short D8  = D/8;
+    constexpr short D4  = D/4;
+    constexpr short BK8 = BK/8;
+
+    const int iq1 = tgpig.x*BQ;
+    const int iq2 = tgpig.y;
+    const int iq3 = tgpig.z;
+
+    threadgroup half * sq = shmem;
+    threadgroup half * sk = shmem;
+    threadgroup half * sv = shmem + BK*LD;
+
+    q += (uint64_t) iq2*args.nb02 + (uint64_t) iq3*args.nb03;
+
+    const int ikv2 = iq2/(args.ne02/args.ne_12_2);
+    const int ikv3 = iq3/(args.ne03/args.ne_12_3);
+
+    k += (uint64_t) ikv2*args.nb12 + (uint64_t) ikv3*args.nb13;
+    v += (uint64_t) ikv2*args.nb22 + (uint64_t) ikv3*args.nb23;
+
+    for (short e = tiitg; e < BQ*D4; e += NT) {
+        const short r = e/D4;
+        const short c = e%D4;
+
+        half4 val = 0;
+        if (iq1 + r < args.ne01) {
+            val = (half4) ((device const float4 *) (q + (uint64_t) (iq1 + r)*args.nb01))[c];
+        }
+
+        *((threadgroup half4 *) (sq + r*LD) + c) = val;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    simdgroup_half8x8 mq[D8];
+    FOR_UNROLL (short d = 0; d < D8; ++d) {
+        simdgroup_load(mq[d], sq + 8*sgitg*LD + 8*d, LD);
+    }
+
+    simdgroup_float8x8 mo[D8];
+    FOR_UNROLL (short d = 0; d < D8; ++d) {
+        mo[d] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    }
+
+    const short qid = tiisg/4;
+    const short fm  = (qid & 4) + ((tiisg/2) % 4);
+    const short fn  = (qid & 2)*2 + (tiisg % 2)*2;
+
+    float M = -FLT_MAX/2;
+    float S = 0.0f;
+
+    for (int ic = 0; ic < args.ne11; ic += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (short e = tiitg; e < BK*D4; e += NT) {
+            const short r = e/D4;
+            const short c = e%D4;
+
+            half4 kv = 0;
+            half4 vv = 0;
+            if (ic + r < args.ne11) {
+                kv = ((device const half4 *) (k + (uint64_t) (ic + r)*args.nb11))[c];
+                vv = ((device const half4 *) (v + (uint64_t) (ic + r)*args.nb21))[c];
+            }
+
+            *((threadgroup half4 *) (sk + r*LD) + c) = kv;
+            *((threadgroup half4 *) (sv + r*LD) + c) = vv;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_float8x8 ms[BK8];
+        FOR_UNROLL (short j = 0; j < BK8; ++j) {
+            ms[j] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+            FOR_UNROLL (short d = 0; d < D8; ++d) {
+                simdgroup_half8x8 mk;
+                simdgroup_load(mk, sk + 8*j*LD + 8*d, LD, 0, true);
+                simdgroup_multiply_accumulate(ms[j], mq[d], mk, ms[j]);
+            }
+        }
+
+        float mx = -FLT_MAX/2;
+        FOR_UNROLL (short j = 0; j < BK8; ++j) {
+            thread auto & es = ms[j].thread_elements();
+            FOR_UNROLL (short t = 0; t < 2; ++t) {
+                float s = es[t]*args.scale;
+                if (ic + 8*j + fn + t >= args.ne11) {
+                    s = -INFINITY;
+                }
+                es[t] = s;
+                mx = max(mx, s);
+            }
+        }
+        mx = max(mx, simd_shuffle_xor(mx, 1));
+        mx = max(mx, simd_shuffle_xor(mx, 8));
+
+        const float mn = max(M, mx);
+        const float fs = exp(M - mn);
+        M = mn;
+
+        float sum = 0.0f;
+        simdgroup_half8x8 mp[BK8];
+        FOR_UNROLL (short j = 0; j < BK8; ++j) {
+            thread auto & es = ms[j].thread_elements();
+            thread auto & ep = mp[j].thread_elements();
+            FOR_UNROLL (short t = 0; t < 2; ++t) {
+                const float p = exp(es[t] - mn);
+                sum += p;
+                ep[t] = p;
+            }
+        }
+        sum += simd_shuffle_xor(sum, 1);
+        sum += simd_shuffle_xor(sum, 8);
+        S = S*fs + sum;
+
+        FOR_UNROLL (short d = 0; d < D8; ++d) {
+            thread auto & eo = mo[d].thread_elements();
+            eo[0] *= fs;
+            eo[1] *= fs;
+        }
+
+        FOR_UNROLL (short d = 0; d < D8; ++d) {
+            FOR_UNROLL (short j = 0; j < BK8; ++j) {
+                simdgroup_half8x8 mv;
+                simdgroup_load(mv, sv + 8*j*LD + 8*d, LD);
+                simdgroup_multiply_accumulate(mo[d], mp[j], mv, mo[d]);
+            }
+        }
+    }
+
+    const int row = iq1 + 8*sgitg + fm;
+    if (row < args.ne01) {
+        const float is = S == 0.0f ? 0.0f : 1.0f/S;
+        device float * o = (device float *) dst + ((uint64_t) iq3*args.ne2*args.ne1 + iq2 + (uint64_t) row*args.ne1)*D;
+        FOR_UNROLL (short d = 0; d < D8; ++d) {
+            thread auto & eo = mo[d].thread_elements();
+            *((device float2 *) (o + 8*d + fn)) = float2(eo[0], eo[1])*is;
+        }
+    }
+}
+
+typedef decltype(kernel_flash_attn_ext_mma<128, 16>) flash_attn_ext_mma_t;
+
+template [[host_name("kernel_flash_attn_ext_mma_d128")]] kernel flash_attn_ext_mma_t kernel_flash_attn_ext_mma<128, 16>;
