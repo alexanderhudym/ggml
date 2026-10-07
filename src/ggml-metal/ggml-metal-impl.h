@@ -1409,4 +1409,21 @@ typedef struct {
     int64_t ne;
 } ggml_metal_kargs_silu_back;
 
+typedef struct {
+    uint64_t nb11;
+    uint64_t in_stride;
+    uint64_t out_stride;
+    int32_t  K;
+    int32_t  M;
+    int32_t  N;
+    int32_t  G;
+    int32_t  n_seg;
+    int32_t  seg_end[4];
+    float    scale;
+    float    inv_scale;
+    uint32_t seq;
+    int32_t  tgx;
+    int32_t  tgy;
+} ggml_metal_kargs_offload;
+
 #endif // GGML_METAL_IMPL

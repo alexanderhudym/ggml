@@ -89,6 +89,13 @@ void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int 
 
 void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder);
 
+void ggml_metal_encoder_use_resource(ggml_metal_encoder_t encoder, void * buffer, bool write);
+
+void ggml_metal_encoder_dispatch_threadgroups_indirect(ggml_metal_encoder_t encoder, struct ggml_metal_buffer_id args, int tptg0, int tptg1, int tptg2);
+
+void ggml_metal_cmd_buf_encode_wait   (ggml_metal_cmd_buf_t cmd_buf, void * event, uint64_t value);
+void ggml_metal_cmd_buf_wait_completed(ggml_metal_cmd_buf_t cmd_buf);
+
 void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder);
 
 //
@@ -103,6 +110,8 @@ ggml_metal_library_t ggml_metal_library_init_from_source(ggml_metal_device_t dev
 void ggml_metal_library_free(ggml_metal_library_t lib);
 
 ggml_metal_device_t ggml_metal_library_get_device(ggml_metal_library_t lib);
+
+bool ggml_metal_library_has_function(ggml_metal_library_t lib, const char * name);
 
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline    (ggml_metal_library_t lib, const char * name);
 struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_metal_library_t lib, const char * base, const char * name, ggml_metal_cv_t cv);
@@ -319,6 +328,17 @@ ggml_metal_device_t ggml_metal_device_get(int device, int n_devices);
 
 void * ggml_metal_device_get_obj  (ggml_metal_device_t dev); // id<MTLDevice>
 void * ggml_metal_device_get_queue(ggml_metal_device_t dev); // id<MTLCommandQueue>
+
+void * ggml_metal_object_retain (void * obj);
+void   ggml_metal_object_release(void * obj);
+
+void * ggml_metal_device_new_shared_buffer(ggml_metal_device_t dev, size_t size);
+void * ggml_metal_device_new_shared_event (ggml_metal_device_t dev);
+
+void ggml_metal_shared_event_set(void * event, uint64_t value);
+
+void * ggml_metal_buffer_contents(void * buffer);
+bool   ggml_metal_buffer_fits    (ggml_metal_device_t dev, void * buffer, size_t size);
 
 ggml_metal_library_t ggml_metal_device_get_library(ggml_metal_device_t dev);
 

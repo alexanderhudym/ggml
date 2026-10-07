@@ -7,6 +7,7 @@
 #import "ggml-metal-common.h"
 #import "ggml-metal-ops.h"
 #import "ggml-metal-fusion.h"
+#import "ggml-metal-offload-impl.h"
 
 #import <Foundation/Foundation.h>
 
@@ -496,6 +497,8 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
     @autoreleasepool {
         ctx->gf = gf;
 
+        ggml_metal_offload_prepare(ctx->dev, gf);
+
         if (ctx->n_cb == 0) {
             // single-threaded encoding: the whole graph is encoded by one command buffer
             ctx->n_nodes_0      = gf->n_nodes;
@@ -591,6 +594,8 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         }
 
         dispatch_apply(n_cb, ctx->d_queue, ctx->encode_async);
+
+        ggml_metal_offload_finish((ggml_metal_cmd_buf_t) ctx->cmd_buf_last);
 
         // for debugging: block until graph is computed
         //[ctx->cmd_buf_last waitUntilCompleted];
