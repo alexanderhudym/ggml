@@ -129,6 +129,7 @@
 #define OP_FLASH_ATTN_EXT_VEC_NCPSG 32
 
 #define OP_MUL_MM_DEQ_MIN_ROWS 256
+#define OP_MUL_MM64_MIN_ROWS   256
 
 #define OP_LIGHTNING_INDEXER_DK    128
 #define OP_LIGHTNING_INDEXER_NH     64
@@ -518,6 +519,15 @@ typedef struct {
     uint64_t nb03;
     uint64_t total;
 } ggml_metal_kargs_mul_mm_deq;
+
+typedef struct {
+    int32_t  ne10;
+    int32_t  ne11;
+    int32_t  ne12;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+} ggml_metal_kargs_mul_mm64_cvt;
 
 typedef struct {
     int32_t  ne00;
