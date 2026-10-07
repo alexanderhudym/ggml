@@ -981,3 +981,41 @@ template [[host_name("kernel_mul_mm_id_iq4_nl_f16")]]  kernel mul_mm_id kernel_m
 template [[host_name("kernel_mul_mm_id_iq4_xs_f16")]]  kernel mul_mm_id kernel_mul_mm_id<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq4_xs,  QK_NL, dequantize_iq4_xs,  float,  float4x4,  half, half2x4>;
 template [[host_name("kernel_mul_mm_id_tq2_0_f16")]]   kernel mul_mm_id kernel_mul_mm_id<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_tq2_0,   QK_NL, dequantize_tq2_0,   float,  float4x4,  half, half2x4>;
 
+
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &)>
+kernel void kernel_mul_mm_deq(
+        constant ggml_metal_kargs_mul_mm_deq & args,
+        device const char * src0,
+        device       char * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    if ((uint64_t) tpig >= args.total) {
+        return;
+    }
+
+    const uint32_t row = tpig/args.nch;
+    const uint32_t c   = tpig - row*args.nch;
+    const uint32_t i01 = row % args.ne01;
+    const uint32_t r12 = row / args.ne01;
+    const uint32_t i02 = r12 % args.ne02;
+    const uint32_t i03 = r12 / args.ne02;
+
+    device const block_q * x = (device const block_q *) (src0 + (uint64_t) i01*args.nb01 + (uint64_t) i02*args.nb02 + (uint64_t) i03*args.nb03);
+
+    half4x4 t;
+    dequantize_func(x + c/nl, c%nl, t);
+
+    ((device half4x4 *) dst)[(uint64_t) row*args.nch + c] = t;
+}
+
+typedef decltype(kernel_mul_mm_deq<block_q4_0, 2, dequantize_q4_0>) mul_mm_deq_t;
+
+template [[host_name("kernel_mul_mm_deq_q4_0")]] kernel mul_mm_deq_t kernel_mul_mm_deq<block_q4_0, 2,     dequantize_q4_0>;
+template [[host_name("kernel_mul_mm_deq_q4_1")]] kernel mul_mm_deq_t kernel_mul_mm_deq<block_q4_1, 2,     dequantize_q4_1>;
+template [[host_name("kernel_mul_mm_deq_q5_0")]] kernel mul_mm_deq_t kernel_mul_mm_deq<block_q5_0, 2,     dequantize_q5_0>;
+template [[host_name("kernel_mul_mm_deq_q5_1")]] kernel mul_mm_deq_t kernel_mul_mm_deq<block_q5_1, 2,     dequantize_q5_1>;
+template [[host_name("kernel_mul_mm_deq_q8_0")]] kernel mul_mm_deq_t kernel_mul_mm_deq<block_q8_0, 2,     dequantize_q8_0>;
+template [[host_name("kernel_mul_mm_deq_q2_K")]] kernel mul_mm_deq_t kernel_mul_mm_deq<block_q2_K, QK_NL, dequantize_q2_K>;
+template [[host_name("kernel_mul_mm_deq_q3_K")]] kernel mul_mm_deq_t kernel_mul_mm_deq<block_q3_K, QK_NL, dequantize_q3_K>;
+template [[host_name("kernel_mul_mm_deq_q4_K")]] kernel mul_mm_deq_t kernel_mul_mm_deq<block_q4_K, QK_NL, dequantize_q4_K>;
+template [[host_name("kernel_mul_mm_deq_q5_K")]] kernel mul_mm_deq_t kernel_mul_mm_deq<block_q5_K, QK_NL, dequantize_q5_K>;
+template [[host_name("kernel_mul_mm_deq_q6_K")]] kernel mul_mm_deq_t kernel_mul_mm_deq<block_q6_K, QK_NL, dequantize_q6_K>;
