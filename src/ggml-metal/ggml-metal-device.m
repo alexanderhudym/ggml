@@ -129,7 +129,8 @@ int ggml_metal_pipeline_max_theads_per_threadgroup(struct ggml_metal_pipeline_wi
     X(UPSCALE,         upscale)        \
     X(ARGSORT,         argsort)        \
     X(POOL,            pool)           \
-    X(MISC,            misc)
+    X(MISC,            misc)           \
+    X(OFFLOAD,         offload)
 
 enum ggml_metal_lib_kind {
 #define X(e, s) GGML_METAL_LIB_##e,
@@ -684,6 +685,22 @@ ggml_metal_device_t ggml_metal_library_get_device(ggml_metal_library_t lib) {
     return lib->dev;
 }
 
+bool ggml_metal_library_has_function(ggml_metal_library_t lib, const char * name) {
+    @autoreleasepool {
+        NSString * fname = [NSString stringWithUTF8String:name];
+
+        if (lib->override_fns && [lib->override_fns containsObject:fname]) {
+            return true;
+        }
+
+        if (lib->single_library) {
+            return [[lib->objs[0] functionNames] containsObject:fname];
+        }
+
+        return lib->fn_to_lib[fname] != nil;
+    }
+}
+
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline(ggml_metal_library_t lib, const char * name) {
     [lib->lock lock];
 
@@ -877,6 +894,58 @@ void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int 
 
 void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder) {
     [encoder->obj memoryBarrierWithScope:MTLBarrierScopeBuffers];
+}
+
+void ggml_metal_encoder_use_resource(ggml_metal_encoder_t encoder, void * buffer, bool write) {
+    [encoder->obj useResource:(id<MTLBuffer>) buffer usage:write ? (MTLResourceUsageRead | MTLResourceUsageWrite) : MTLResourceUsageRead];
+}
+
+void ggml_metal_encoder_dispatch_threadgroups_indirect(ggml_metal_encoder_t encoder, struct ggml_metal_buffer_id args, int tptg0, int tptg1, int tptg2) {
+    [encoder->obj dispatchThreadgroupsWithIndirectBuffer:(id<MTLBuffer>) args.metal
+                                    indirectBufferOffset:args.offs
+                                   threadsPerThreadgroup:MTLSizeMake(tptg0, tptg1, tptg2)];
+}
+
+void ggml_metal_cmd_buf_encode_wait(ggml_metal_cmd_buf_t cmd_buf_raw, void * event, uint64_t value) {
+    id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
+
+    [cmd_buf encodeWaitForEvent:(id<MTLEvent>) event value:value];
+}
+
+void ggml_metal_cmd_buf_wait_completed(ggml_metal_cmd_buf_t cmd_buf_raw) {
+    id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
+
+    [cmd_buf waitUntilCompleted];
+}
+
+void * ggml_metal_object_retain(void * obj) {
+    return [(id) obj retain];
+}
+
+void ggml_metal_object_release(void * obj) {
+    [(id) obj release];
+}
+
+void * ggml_metal_device_new_shared_buffer(ggml_metal_device_t dev, size_t size) {
+    return [(id<MTLDevice>) ggml_metal_device_get_obj(dev) newBufferWithLength:size options:MTLResourceStorageModeShared];
+}
+
+void * ggml_metal_device_new_shared_event(ggml_metal_device_t dev) {
+    return [(id<MTLDevice>) ggml_metal_device_get_obj(dev) newSharedEvent];
+}
+
+void ggml_metal_shared_event_set(void * event, uint64_t value) {
+    [(id<MTLSharedEvent>) event setSignaledValue:value];
+}
+
+void * ggml_metal_buffer_contents(void * buffer) {
+    return [(id<MTLBuffer>) buffer contents];
+}
+
+bool ggml_metal_buffer_fits(ggml_metal_device_t dev, void * buffer, size_t size) {
+    id<MTLBuffer> buf = (id<MTLBuffer>) buffer;
+
+    return buffer != NULL && buf.device == (id<MTLDevice>) ggml_metal_device_get_obj(dev) && buf.storageMode == MTLStorageModeShared && size <= buf.length;
 }
 
 void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder) {

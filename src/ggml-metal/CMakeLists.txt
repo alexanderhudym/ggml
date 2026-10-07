@@ -11,6 +11,7 @@ ggml_add_backend_library(ggml-metal
                          ggml-metal-common.cpp
                          ggml-metal-context.m
                          ggml-metal-fusion.cpp
+                         ggml-metal-offload.cpp
                          ggml-metal-ops.cpp
                          ggml-metal-tuning.cpp
                         )
@@ -51,6 +52,7 @@ set(METALLIB_KERNEL_SOURCES
     kernels/argsort.metal
     kernels/pool.metal
     kernels/misc.metal
+    kernels/offload.metal
 )
 
 if (GGML_METAL_EMBED_LIBRARY)
