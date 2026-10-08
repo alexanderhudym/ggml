@@ -84,6 +84,20 @@ kernel void kernel_offload_fence(
     atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_system);
 }
 
+kernel void kernel_split_copy(
+        constant ggml_metal_kargs_split_copy & args,
+        device const uchar * weight,
+        device const uchar * slot,
+        device       uchar * dst,
+        uint tgpig[[threadgroup_position_in_grid]],
+        uint tiitg[[thread_index_in_threadgroup]]) {
+    const uint64_t i = (uint64_t) tgpig*256 + tiitg;
+
+    if (i < args.total) {
+        dst[i] = i < args.gpu_bytes ? weight[i] : slot[i - args.gpu_bytes];
+    }
+}
+
 kernel void kernel_offload_merge(
         constant ggml_metal_kargs_offload & args,
         device const char  * out,

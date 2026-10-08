@@ -13,6 +13,7 @@ ggml_add_backend_library(ggml-metal
                          ggml-metal-fusion.cpp
                          ggml-metal-offload.cpp
                          ggml-metal-ops.cpp
+                         ggml-metal-split.cpp
                          ggml-metal-tuning.cpp
                         )
 

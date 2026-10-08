@@ -336,6 +336,7 @@ void   ggml_metal_object_release(void * obj);
 
 void * ggml_metal_device_new_shared_buffer(ggml_metal_device_t dev, size_t size);
 void * ggml_metal_device_new_shared_event (ggml_metal_device_t dev);
+void * ggml_metal_device_wrap_buffer      (ggml_metal_device_t dev, void * ptr, size_t size);
 
 void ggml_metal_shared_event_set(void * event, uint64_t value);
 

@@ -1438,4 +1438,9 @@ typedef struct {
     int32_t  tgd;
 } ggml_metal_kargs_offload;
 
+typedef struct {
+    uint64_t gpu_bytes;
+    uint64_t total;
+} ggml_metal_kargs_split_copy;
+
 #endif // GGML_METAL_IMPL
