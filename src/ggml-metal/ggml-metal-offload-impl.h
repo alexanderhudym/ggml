@@ -17,12 +17,9 @@ struct ggml_metal_offload_call {
     uint64_t seq;
     uint64_t in_stride;
     uint64_t out_stride;
-    uint64_t mean_stride;
 
     struct ggml_metal_buffer_id in;
     struct ggml_metal_buffer_id out;
-    struct ggml_metal_buffer_id mean_in;
-    struct ggml_metal_buffer_id center;
     struct ggml_metal_buffer_id scratch;
     struct ggml_metal_buffer_id fence;
     struct ggml_metal_buffer_id slot;

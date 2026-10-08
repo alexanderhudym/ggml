@@ -2732,7 +2732,7 @@ static int ggml_metal_op_mul_mat_offload(ggml_metal_op_t ctx, int idx, const ggm
         /*.nb11       =*/ nb11,
         /*.in_stride  =*/ call->in_stride,
         /*.out_stride =*/ call->out_stride,
-        /*.mean_stride=*/ call->mean_stride,
+        /*.nb01       =*/ nb01,
         /*.K          =*/ ne00,
         /*.M          =*/ ne11,
         /*.N          =*/ ne0,
@@ -2751,6 +2751,9 @@ static int ggml_metal_op_mul_mat_offload(ggml_metal_op_t ctx, int idx, const ggm
     const ggml_metal_buffer_id bid_dst  = ggml_metal_get_buffer_id(op);
 
     ggml_metal_buffer_id bid_means = call->scratch;
+
+    ggml_metal_buffer_id bid_w2 = bid_a;
+    bid_w2.offs += (uint64_t) G*a16.nb[1];
 
     auto pipeline = ggml_metal_library_get_pipeline_mul_mm(lib, &op16, false);
 
@@ -2784,10 +2787,6 @@ static int ggml_metal_op_mul_mat_offload(ggml_metal_op_t ctx, int idx, const ggm
     ggml_metal_encoder_use_resource(enc, call->fence.metal,   true);
 
     if (call->n_seg > 0) {
-        ggml_metal_encoder_use_resource(enc, call->mean_in.metal, true);
-    }
-
-    if (call->n_seg > 0) {
         ggml_metal_encoder_set_pipeline(enc, compile("kernel_offload_mean"));
         ggml_metal_encoder_set_bytes   (enc, &oargs, sizeof(oargs), 0);
         ggml_metal_encoder_set_buffer  (enc, bid_src1,  1);
@@ -2801,8 +2800,7 @@ static int ggml_metal_op_mul_mat_offload(ggml_metal_op_t ctx, int idx, const ggm
     ggml_metal_encoder_set_buffer  (enc, bid_src1,  1);
     ggml_metal_encoder_set_buffer  (enc, bid_means, 2);
     ggml_metal_encoder_set_buffer  (enc, call->in,  3);
-    ggml_metal_encoder_set_buffer  (enc, call->n_seg > 0 ? call->mean_in : call->in, 4);
-    ggml_metal_encoder_dispatch_threadgroups(enc, (ne00/4 + 63)/64, (ne11 + call->n_seg + 3)/4, 1, 64, 4, 1);
+    ggml_metal_encoder_dispatch_threadgroups(enc, (ne00/4 + 63)/64, (ne11 + 3)/4, 1, 64, 4, 1);
     ggml_metal_encoder_memory_barrier(enc);
 
     ggml_metal_encoder_set_pipeline(enc, compile("kernel_offload_fence"));
@@ -2824,6 +2822,28 @@ static int ggml_metal_op_mul_mat_offload(ggml_metal_op_t ctx, int idx, const ggm
     ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline_g.smem, 0);
     ggml_metal_encoder_dispatch_threadgroups(enc, (ne11 + pipeline_g.nr1 - 1)/pipeline_g.nr1, G/pipeline_g.nr0, 1, 32, pipeline_g.nsg, 1);
 
+    if (call->n_seg > 0) {
+        if (sp) {
+            ggml_metal_op_split_wait(ctx, op, sp);
+
+            enc = ctx->enc;
+
+            ggml_metal_encoder_use_resource(enc, call->scratch.metal, true);
+        }
+
+        ggml_metal_buffer_id bid_rows = sp ? sp->slot : ggml_metal_get_buffer_id(op->src[0]);
+        if (!sp) {
+            bid_rows.offs += (uint64_t) G*nb01;
+        }
+
+        ggml_metal_encoder_set_pipeline(enc, ggml_metal_library_get_pipeline_offload_center(lib, op->src[0]->type));
+        ggml_metal_encoder_set_bytes   (enc, &oargs, sizeof(oargs), 0);
+        ggml_metal_encoder_set_buffer  (enc, bid_rows,  1);
+        ggml_metal_encoder_set_buffer  (enc, bid_means, 2);
+        ggml_metal_encoder_set_buffer  (enc, bid_w2,    3);
+        ggml_metal_encoder_dispatch_threadgroups(enc, (NG + 3)/4, 1, 1, 32, 4, 1);
+    }
+
     if (ctx->use_capture) {
         ggml_metal_encoder_debug_group_pop(ctx->enc);
     }
@@ -2832,7 +2852,7 @@ static int ggml_metal_op_mul_mat_offload(ggml_metal_op_t ctx, int idx, const ggm
     ggml_metal_encoder_free(ctx->enc);
 
     ggml_metal_cmd_buf_encode_wait(ctx->cmd_buf, call->event, call->seq);
-    if (sp) {
+    if (sp && call->n_seg == 0) {
         ggml_metal_cmd_buf_encode_wait(ctx->cmd_buf, sp->event, sp->fseq);
     }
 
@@ -2853,17 +2873,13 @@ static int ggml_metal_op_mul_mat_offload(ggml_metal_op_t ctx, int idx, const ggm
         ggml_metal_encoder_use_resource(enc, sp->slot.metal, true);
     }
 
-    if (call->n_seg > 0) {
-        ggml_metal_encoder_use_resource(enc, call->center.metal, false);
-    }
-
     ggml_metal_buffer_id bid_flag = call->slot;
     bid_flag.offs += sizeof(uint32_t);
 
     ggml_metal_encoder_set_pipeline(enc, compile("kernel_offload_merge"));
     ggml_metal_encoder_set_bytes   (enc, &oargs, sizeof(oargs), 0);
     ggml_metal_encoder_set_buffer  (enc, call->out, 1);
-    ggml_metal_encoder_set_buffer  (enc, call->n_seg > 0 ? call->center : call->out, 2);
+    ggml_metal_encoder_set_buffer  (enc, call->n_seg > 0 ? bid_w2 : call->out, 2);
     ggml_metal_encoder_set_buffer  (enc, bid_dst,   3);
     ggml_metal_encoder_set_buffer  (enc, bid_flag,  4);
     ggml_metal_encoder_dispatch_threadgroups(enc, (NG/4 + 63)/64, (ne11 + 3)/4, 1, 64, 4, 1);
@@ -2875,10 +2891,8 @@ static int ggml_metal_op_mul_mat_offload(ggml_metal_op_t ctx, int idx, const ggm
     ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, 1, 1, 1);
     ggml_metal_encoder_memory_barrier(enc);
 
-    ggml_metal_buffer_id bid_w2   = bid_a;
     ggml_metal_buffer_id bid_dst2 = bid_dst;
     ggml_metal_buffer_id bid_ind  = call->slot;
-    bid_w2.offs   += (uint64_t) G*anb01;
     bid_dst2.offs += (uint64_t) G*sizeof(float);
     bid_ind.offs  += 2*sizeof(uint32_t);
 

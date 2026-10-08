@@ -357,24 +357,6 @@ static const char * offload_check_plan(offload_registration * r, const ggml_meta
         return "the buffers must be shared buffers of the backend's device and large enough";
     }
 
-    if (p.n_seg > 0) {
-        if (p.mean_in_offset % 16 != 0 || p.mean_in_stride % 16 != 0 || p.mean_in_stride < (size_t) (2*K)) {
-            return "the mean input offset and stride must be multiples of 16 and the stride must cover a row";
-        }
-
-        size_t mean_end = 0;
-        if (__builtin_mul_overflow((size_t) (p.n_seg - 1), p.mean_in_stride, &mean_end) ||
-            __builtin_add_overflow(mean_end, p.mean_in_offset, &mean_end) ||
-            __builtin_add_overflow(mean_end, (size_t) (2*K), &mean_end) ||
-            !ggml_metal_buffer_fits(r->dev, p.mean_in, mean_end)) {
-            return "the mean input must be a shared buffer of the backend's device and hold one row per segment";
-        }
-
-        if (!ggml_metal_buffer_fits(r->dev, p.center, 4*(size_t) p.n_seg*(size_t) (N - G))) {
-            return "the centering buffer must be a shared buffer of the backend's device and hold one row per segment";
-        }
-    }
-
     return nullptr;
 }
 
@@ -468,11 +450,8 @@ void ggml_metal_offload_prepare(ggml_metal_device_t dev, ggml_cgraph * gf) {
         c.seq         = seq;
         c.in_stride   = p.in_stride;
         c.out_stride  = p.out_stride;
-        c.mean_stride = p.mean_in_stride;
         c.in          = { p.in,  0 };
         c.out         = { p.out, 0 };
-        c.mean_in     = { p.mean_in, p.mean_in_offset };
-        c.center      = { p.center, 0 };
         c.scratch     = { sc->second.buf, 0 };
         c.fence       = { r->fence_buf, 0 };
         c.slot        = { r->slot_buf, (seq % OFFLOAD_MAX_CALLS)*OFFLOAD_SLOT_WORDS*sizeof(uint32_t) };
