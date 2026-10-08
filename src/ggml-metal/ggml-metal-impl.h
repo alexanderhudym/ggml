@@ -1423,6 +1423,7 @@ typedef struct {
     uint64_t nb11;
     uint64_t in_stride;
     uint64_t out_stride;
+    uint64_t mean_stride;
     int32_t  K;
     int32_t  M;
     int32_t  N;
@@ -1434,6 +1435,7 @@ typedef struct {
     uint32_t seq;
     int32_t  tgx;
     int32_t  tgy;
+    int32_t  tgd;
 } ggml_metal_kargs_offload;
 
 #endif // GGML_METAL_IMPL
