@@ -5,6 +5,7 @@
 #import "ggml-backend-impl.h"
 #import "ggml-metal-impl.h"
 #import "ggml-metal-common.h"
+#import "ggml-metal-split.h"
 
 #include <Foundation/Foundation.h>
 
@@ -928,6 +929,10 @@ void ggml_metal_object_release(void * obj) {
 
 void * ggml_metal_device_new_shared_buffer(ggml_metal_device_t dev, size_t size) {
     return [(id<MTLDevice>) ggml_metal_device_get_obj(dev) newBufferWithLength:size options:MTLResourceStorageModeShared];
+}
+
+void * ggml_metal_device_wrap_buffer(ggml_metal_device_t dev, void * ptr, size_t size) {
+    return [(id<MTLDevice>) ggml_metal_device_get_obj(dev) newBufferWithBytesNoCopy:ptr length:size options:MTLResourceStorageModeShared deallocator:nil];
 }
 
 void * ggml_metal_device_new_shared_event(ggml_metal_device_t dev) {
@@ -2560,7 +2565,12 @@ void ggml_metal_buffer_clear(ggml_metal_buffer_t buf, uint8_t value) {
 struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, const struct ggml_tensor * t) {
     struct ggml_metal_buffer_id res = { nil, 0 };
 
-    const int64_t tsize = ggml_nbytes(t);
+    int64_t tsize = ggml_nbytes(t);
+
+    const size_t extent = ggml_metal_split_extent(buf, t);
+    if (extent > 0) {
+        tsize = (int64_t) extent;
+    }
 
     // find the view that contains the tensor fully
     for (int i = 0; i < buf->n_buffers; ++i) {
