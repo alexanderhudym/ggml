@@ -2558,7 +2558,11 @@ static void ggml_metal_op_mul_mat_cvt(ggml_metal_op_t ctx, const ggml_tensor * o
     ggml_metal_encoder_dispatch_threadgroups(enc, (b->ne[0]/4 + 63)/64, b->ne[1], b->ne[2]*b->ne[3], 64, 1, 1);
 }
 
-static void ggml_metal_op_mul_mat_deq(ggml_metal_op_t ctx, const ggml_tensor * op, ggml_metal_buffer_id bid_dst) {
+static int ggml_metal_op_mul_mat_deq_nth(ggml_metal_op_t ctx, const ggml_tensor * op) {
+    return MIN(256, ggml_metal_pipeline_max_theads_per_threadgroup(ggml_metal_library_get_pipeline_mul_mm_deq(ctx->lib, op->src[0]->type)));
+}
+
+static void ggml_metal_op_mul_mat_deq(ggml_metal_op_t ctx, const ggml_tensor * op, ggml_metal_buffer_id bid_dst, int32_t row0 = 0, int32_t nrows = -1, const ggml_metal_buffer_id * bid_ind = nullptr) {
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
 
@@ -2566,11 +2570,12 @@ static void ggml_metal_op_mul_mat_deq(ggml_metal_op_t ctx, const ggml_tensor * o
 
     auto pipeline = ggml_metal_library_get_pipeline_mul_mm_deq(lib, a->type);
 
+    const int32_t  ne01  = nrows < 0 ? (int32_t) a->ne[1] : nrows;
     const int32_t  nch   = a->ne[0]/16;
-    const uint64_t total = (uint64_t) nch*a->ne[1]*a->ne[2]*a->ne[3];
+    const uint64_t total = (uint64_t) nch*ne01*a->ne[2]*a->ne[3];
 
     ggml_metal_kargs_mul_mm_deq args = {
-        /*.ne01  =*/ (int32_t) a->ne[1],
+        /*.ne01  =*/ ne01,
         /*.ne02  =*/ (int32_t) a->ne[2],
         /*.nch   =*/ nch,
         /*.nb01  =*/ a->nb[1],
@@ -2579,13 +2584,21 @@ static void ggml_metal_op_mul_mat_deq(ggml_metal_op_t ctx, const ggml_tensor * o
         /*.total =*/ total,
     };
 
-    const int nth = MIN(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+    const int nth = ggml_metal_op_mul_mat_deq_nth(ctx, op);
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(a), 1);
+
+    ggml_metal_buffer_id bid_src = ggml_metal_get_buffer_id(a);
+    bid_src.offs += (uint64_t) row0*a->nb[1];
+
+    ggml_metal_encoder_set_buffer  (enc, bid_src, 1);
     ggml_metal_encoder_set_buffer  (enc, bid_dst, 2);
-    ggml_metal_encoder_dispatch_threadgroups(enc, (total + nth - 1)/nth, 1, 1, nth, 1, 1);
+    if (bid_ind) {
+        ggml_metal_encoder_dispatch_threadgroups_indirect(enc, *bid_ind, nth, 1, 1);
+    } else {
+        ggml_metal_encoder_dispatch_threadgroups(enc, (total + nth - 1)/nth, 1, 1, nth, 1, 1);
+    }
 
     ggml_metal_op_concurrency_reset(ctx);
 }
@@ -2605,10 +2618,12 @@ static int ggml_metal_op_mul_mat_offload(ggml_metal_op_t ctx, int idx, const ggm
     const int32_t G  = (int32_t) call->gpu_rows;
     const int32_t NG = ne01 - G;
 
+    const int deq_nth = ggml_metal_op_mul_mat_deq_nth(ctx, op);
+
     ggml_metal_buffer_id bid_a = ggml_metal_get_buffer_id(op);
     bid_a.offs += ggml_metal_op_mul_mat_deq_offs(op);
 
-    ggml_metal_op_mul_mat_deq(ctx, op, bid_a);
+    ggml_metal_op_mul_mat_deq(ctx, op, bid_a, 0, G);
 
     ggml_tensor a16 = *op->src[0];
     a16.type  = GGML_TYPE_F16;
@@ -2642,6 +2657,7 @@ static int ggml_metal_op_mul_mat_offload(ggml_metal_op_t ctx, int idx, const ggm
         /*.nb11       =*/ nb11,
         /*.in_stride  =*/ call->in_stride,
         /*.out_stride =*/ call->out_stride,
+        /*.mean_stride=*/ call->mean_stride,
         /*.K          =*/ ne00,
         /*.M          =*/ ne11,
         /*.N          =*/ ne0,
@@ -2653,14 +2669,13 @@ static int ggml_metal_op_mul_mat_offload(ggml_metal_op_t ctx, int idx, const ggm
         /*.seq        =*/ (uint32_t) call->seq,
         /*.tgx        =*/ (ne11 + 31)/32,
         /*.tgy        =*/ NG/64,
+        /*.tgd        =*/ (int32_t) (((uint64_t) (ne00/16)*NG + deq_nth - 1)/deq_nth),
     };
 
     const ggml_metal_buffer_id bid_src1 = ggml_metal_get_buffer_id(op->src[1]);
     const ggml_metal_buffer_id bid_dst  = ggml_metal_get_buffer_id(op);
 
     ggml_metal_buffer_id bid_means = call->scratch;
-    ggml_metal_buffer_id bid_corr  = call->scratch;
-    bid_corr.offs += 16*(size_t) ne00;
 
     auto pipeline = ggml_metal_library_get_pipeline_mul_mm(lib, &op16, false);
 
@@ -2694,6 +2709,10 @@ static int ggml_metal_op_mul_mat_offload(ggml_metal_op_t ctx, int idx, const ggm
     ggml_metal_encoder_use_resource(enc, call->fence.metal,   true);
 
     if (call->n_seg > 0) {
+        ggml_metal_encoder_use_resource(enc, call->mean_in.metal, true);
+    }
+
+    if (call->n_seg > 0) {
         ggml_metal_encoder_set_pipeline(enc, compile("kernel_offload_mean"));
         ggml_metal_encoder_set_bytes   (enc, &oargs, sizeof(oargs), 0);
         ggml_metal_encoder_set_buffer  (enc, bid_src1,  1);
@@ -2707,7 +2726,8 @@ static int ggml_metal_op_mul_mat_offload(ggml_metal_op_t ctx, int idx, const ggm
     ggml_metal_encoder_set_buffer  (enc, bid_src1,  1);
     ggml_metal_encoder_set_buffer  (enc, bid_means, 2);
     ggml_metal_encoder_set_buffer  (enc, call->in,  3);
-    ggml_metal_encoder_dispatch_threadgroups(enc, (ne00/4 + 63)/64, (ne11 + 3)/4, 1, 64, 4, 1);
+    ggml_metal_encoder_set_buffer  (enc, call->n_seg > 0 ? call->mean_in : call->in, 4);
+    ggml_metal_encoder_dispatch_threadgroups(enc, (ne00/4 + 63)/64, (ne11 + call->n_seg + 3)/4, 1, 64, 4, 1);
     ggml_metal_encoder_memory_barrier(enc);
 
     ggml_metal_encoder_set_pipeline(enc, compile("kernel_offload_fence"));
@@ -2729,18 +2749,6 @@ static int ggml_metal_op_mul_mat_offload(ggml_metal_op_t ctx, int idx, const ggm
     ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline_g.smem, 0);
     ggml_metal_encoder_dispatch_threadgroups(enc, (ne11 + pipeline_g.nr1 - 1)/pipeline_g.nr1, G/pipeline_g.nr0, 1, 32, pipeline_g.nsg, 1);
 
-    if (call->n_seg > 0) {
-        ggml_metal_buffer_id bid_w = bid_a;
-        bid_w.offs += (uint64_t) G*anb01;
-
-        ggml_metal_encoder_set_pipeline(enc, compile("kernel_offload_wmu"));
-        ggml_metal_encoder_set_bytes   (enc, &oargs, sizeof(oargs), 0);
-        ggml_metal_encoder_set_buffer  (enc, bid_w,     1);
-        ggml_metal_encoder_set_buffer  (enc, bid_means, 2);
-        ggml_metal_encoder_set_buffer  (enc, bid_corr,  3);
-        ggml_metal_encoder_dispatch_threadgroups(enc, (NG + 3)/4, call->n_seg, 1, 128, 1, 1);
-    }
-
     if (ctx->use_capture) {
         ggml_metal_encoder_debug_group_pop(ctx->enc);
     }
@@ -2761,8 +2769,11 @@ static int ggml_metal_op_mul_mat_offload(ggml_metal_op_t ctx, int idx, const ggm
     enc = ctx->enc;
 
     ggml_metal_encoder_use_resource(enc, call->out.metal,     false);
-    ggml_metal_encoder_use_resource(enc, call->scratch.metal, false);
     ggml_metal_encoder_use_resource(enc, call->slot.metal,    true);
+
+    if (call->n_seg > 0) {
+        ggml_metal_encoder_use_resource(enc, call->center.metal, false);
+    }
 
     ggml_metal_buffer_id bid_flag = call->slot;
     bid_flag.offs += sizeof(uint32_t);
@@ -2770,7 +2781,7 @@ static int ggml_metal_op_mul_mat_offload(ggml_metal_op_t ctx, int idx, const ggm
     ggml_metal_encoder_set_pipeline(enc, compile("kernel_offload_merge"));
     ggml_metal_encoder_set_bytes   (enc, &oargs, sizeof(oargs), 0);
     ggml_metal_encoder_set_buffer  (enc, call->out, 1);
-    ggml_metal_encoder_set_buffer  (enc, bid_corr,  2);
+    ggml_metal_encoder_set_buffer  (enc, call->n_seg > 0 ? call->center : call->out, 2);
     ggml_metal_encoder_set_buffer  (enc, bid_dst,   3);
     ggml_metal_encoder_set_buffer  (enc, bid_flag,  4);
     ggml_metal_encoder_dispatch_threadgroups(enc, (NG/4 + 63)/64, (ne11 + 3)/4, 1, 64, 4, 1);
@@ -2788,6 +2799,12 @@ static int ggml_metal_op_mul_mat_offload(ggml_metal_op_t ctx, int idx, const ggm
     bid_w2.offs   += (uint64_t) G*anb01;
     bid_dst2.offs += (uint64_t) G*sizeof(float);
     bid_ind.offs  += 2*sizeof(uint32_t);
+
+    ggml_metal_buffer_id bid_ind_deq = call->slot;
+    bid_ind_deq.offs += 5*sizeof(uint32_t);
+
+    ggml_metal_op_mul_mat_deq(ctx, op, bid_w2, G, NG, &bid_ind_deq);
+    ggml_metal_encoder_memory_barrier(enc);
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);

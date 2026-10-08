@@ -24,6 +24,12 @@ struct ggml_metal_offload_plan {
     void *  out;
     size_t  out_stride;
 
+    void *  mean_in;
+    size_t  mean_in_offset;
+    size_t  mean_in_stride;
+
+    void *  center;
+
     void *  call;
 };
 
