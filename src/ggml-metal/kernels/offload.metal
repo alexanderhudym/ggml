@@ -1,4 +1,5 @@
 #include "common.h"
+#include "dequantize.h"
 
 #if __METAL_VERSION__ >= 320
 
@@ -27,7 +28,7 @@ kernel void kernel_offload_mean(
         sum += ((device const float *) (src1 + (uint64_t) t*args.nb11))[k];
     }
 
-    mean[(uint64_t) s*args.K + k] = sum/float(t1 - t0);
+    mean[(uint64_t) s*args.K + k] = float(half(sum/float(t1 - t0)*args.scale))*args.inv_scale;
 }
 
 kernel void kernel_offload_cvt(
@@ -35,42 +36,28 @@ kernel void kernel_offload_cvt(
         device const char  * src1,
         device const float * mean,
         volatile coherent(system) device uint * dst,
-        volatile coherent(system) device uint * mean_in,
         uint2 gid[[thread_position_in_grid]]) {
     const int c = gid.x;
     const int t = gid.y;
 
-    if (4*c < args.K && t < args.M + args.n_seg) {
-        if (t < args.M) {
-            float4 v = ((device const float4 *) (src1 + (uint64_t) t*args.nb11))[c];
+    if (4*c < args.K && t < args.M) {
+        float4 v = ((device const float4 *) (src1 + (uint64_t) t*args.nb11))[c];
 
-            if (args.n_seg > 0) {
-                int s = 0;
-                while (t >= args.seg_end[s]) {
-                    ++s;
-                }
-
-                const half4 m = half4(((device const float4 *) (mean + (uint64_t) s*args.K))[c]*args.scale);
-
-                v -= float4(m)*args.inv_scale;
+        if (args.n_seg > 0) {
+            int s = 0;
+            while (t >= args.seg_end[s]) {
+                ++s;
             }
 
-            const half4 h = half4(v*args.scale);
-
-            volatile coherent(system) device uint * row = dst + (uint64_t) t*(args.in_stride/4) + 2*(uint64_t) c;
-
-            row[0] = as_type<uint>(h.xy);
-            row[1] = as_type<uint>(h.zw);
-        } else {
-            const int s = t - args.M;
-
-            const half4 m = half4(((device const float4 *) (mean + (uint64_t) s*args.K))[c]*args.scale);
-
-            volatile coherent(system) device uint * row = mean_in + (uint64_t) s*(args.mean_stride/4) + 2*(uint64_t) c;
-
-            row[0] = as_type<uint>(m.xy);
-            row[1] = as_type<uint>(m.zw);
+            v -= ((device const float4 *) (mean + (uint64_t) s*args.K))[c];
         }
+
+        const half4 h = half4(v*args.scale);
+
+        volatile coherent(system) device uint * row = dst + (uint64_t) t*(args.in_stride/4) + 2*(uint64_t) c;
+
+        row[0] = as_type<uint>(h.xy);
+        row[1] = as_type<uint>(h.zw);
     }
 
     atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_system);
@@ -97,6 +84,63 @@ kernel void kernel_split_copy(
         dst[i] = i < args.gpu_bytes ? weight[i] : slot[i - args.gpu_bytes];
     }
 }
+
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &)>
+kernel void kernel_offload_center(
+        constant ggml_metal_kargs_offload & args,
+        device const char  * src0,
+        device const float * mean,
+        device       float * center,
+        uint   tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const int NG = args.N - args.G;
+    const int j  = 4*int(tgpig) + int(sgitg);
+
+    if (j >= NG) {
+        return;
+    }
+
+    device const block_q * x = (device const block_q *) (src0 + (uint64_t) j*args.nb01);
+
+    float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+    for (int ch = tiisg; ch < args.K/16; ch += 32) {
+        half4x4 w;
+        dequantize_func(x + ch/nl, ch%nl, w);
+
+        for (short s = 0; s < 4; ++s) {
+            if (s < args.n_seg) {
+                device const float4 * m = (device const float4 *) (mean + (uint64_t) s*args.K + 16*(uint64_t) ch);
+
+                acc[s] += dot(float4(w[0]), m[0]) + dot(float4(w[1]), m[1]) + dot(float4(w[2]), m[2]) + dot(float4(w[3]), m[3]);
+            }
+        }
+    }
+
+    for (short s = 0; s < 4; ++s) {
+        if (s < args.n_seg) {
+            const float r = simd_sum(acc[s]);
+
+            if (tiisg == 0) {
+                center[(uint64_t) s*NG + j] = r;
+            }
+        }
+    }
+}
+
+typedef decltype(kernel_offload_center<block_q4_0, 2, dequantize_q4_0>) offload_center_t;
+
+template [[host_name("kernel_offload_center_q4_0")]] kernel offload_center_t kernel_offload_center<block_q4_0, 2,     dequantize_q4_0>;
+template [[host_name("kernel_offload_center_q4_1")]] kernel offload_center_t kernel_offload_center<block_q4_1, 2,     dequantize_q4_1>;
+template [[host_name("kernel_offload_center_q5_0")]] kernel offload_center_t kernel_offload_center<block_q5_0, 2,     dequantize_q5_0>;
+template [[host_name("kernel_offload_center_q5_1")]] kernel offload_center_t kernel_offload_center<block_q5_1, 2,     dequantize_q5_1>;
+template [[host_name("kernel_offload_center_q8_0")]] kernel offload_center_t kernel_offload_center<block_q8_0, 2,     dequantize_q8_0>;
+template [[host_name("kernel_offload_center_q2_K")]] kernel offload_center_t kernel_offload_center<block_q2_K, QK_NL, dequantize_q2_K>;
+template [[host_name("kernel_offload_center_q3_K")]] kernel offload_center_t kernel_offload_center<block_q3_K, QK_NL, dequantize_q3_K>;
+template [[host_name("kernel_offload_center_q4_K")]] kernel offload_center_t kernel_offload_center<block_q4_K, QK_NL, dequantize_q4_K>;
+template [[host_name("kernel_offload_center_q5_K")]] kernel offload_center_t kernel_offload_center<block_q5_K, QK_NL, dequantize_q5_K>;
+template [[host_name("kernel_offload_center_q6_K")]] kernel offload_center_t kernel_offload_center<block_q6_K, QK_NL, dequantize_q6_K>;
 
 kernel void kernel_offload_merge(
         constant ggml_metal_kargs_offload & args,

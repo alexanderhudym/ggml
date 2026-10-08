@@ -1423,7 +1423,7 @@ typedef struct {
     uint64_t nb11;
     uint64_t in_stride;
     uint64_t out_stride;
-    uint64_t mean_stride;
+    uint64_t nb01;
     int32_t  K;
     int32_t  M;
     int32_t  N;
