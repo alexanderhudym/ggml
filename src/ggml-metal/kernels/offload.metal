@@ -63,6 +63,43 @@ kernel void kernel_offload_cvt(
     atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_system);
 }
 
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &)>
+kernel void kernel_offload_deq_w(
+        constant ggml_metal_kargs_offload_deq_w & args,
+        device const char * src0,
+        volatile coherent(system) device uint4 * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    if ((uint64_t) tpig < args.total) {
+        const uint32_t row = tpig/args.nch;
+        const uint32_t c   = tpig - row*args.nch;
+
+        device const block_q * x = (device const block_q *) (src0 + (uint64_t) row*args.nb01);
+
+        half4x4 t;
+        dequantize_func(x + c/nl, c%nl, t);
+
+        volatile coherent(system) device uint4 * o = dst + (uint64_t) row*(args.w_stride/16) + (uint64_t) c*2;
+
+        o[0] = uint4(as_type<uint2>(t[0]), as_type<uint2>(t[1]));
+        o[1] = uint4(as_type<uint2>(t[2]), as_type<uint2>(t[3]));
+    }
+
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_system);
+}
+
+typedef decltype(kernel_offload_deq_w<block_q4_0, 2, dequantize_q4_0>) offload_deq_w_t;
+
+template [[host_name("kernel_offload_deq_w_q4_0")]] kernel offload_deq_w_t kernel_offload_deq_w<block_q4_0, 2,     dequantize_q4_0>;
+template [[host_name("kernel_offload_deq_w_q4_1")]] kernel offload_deq_w_t kernel_offload_deq_w<block_q4_1, 2,     dequantize_q4_1>;
+template [[host_name("kernel_offload_deq_w_q5_0")]] kernel offload_deq_w_t kernel_offload_deq_w<block_q5_0, 2,     dequantize_q5_0>;
+template [[host_name("kernel_offload_deq_w_q5_1")]] kernel offload_deq_w_t kernel_offload_deq_w<block_q5_1, 2,     dequantize_q5_1>;
+template [[host_name("kernel_offload_deq_w_q8_0")]] kernel offload_deq_w_t kernel_offload_deq_w<block_q8_0, 2,     dequantize_q8_0>;
+template [[host_name("kernel_offload_deq_w_q2_K")]] kernel offload_deq_w_t kernel_offload_deq_w<block_q2_K, QK_NL, dequantize_q2_K>;
+template [[host_name("kernel_offload_deq_w_q3_K")]] kernel offload_deq_w_t kernel_offload_deq_w<block_q3_K, QK_NL, dequantize_q3_K>;
+template [[host_name("kernel_offload_deq_w_q4_K")]] kernel offload_deq_w_t kernel_offload_deq_w<block_q4_K, QK_NL, dequantize_q4_K>;
+template [[host_name("kernel_offload_deq_w_q5_K")]] kernel offload_deq_w_t kernel_offload_deq_w<block_q5_K, QK_NL, dequantize_q5_K>;
+template [[host_name("kernel_offload_deq_w_q6_K")]] kernel offload_deq_w_t kernel_offload_deq_w<block_q6_K, QK_NL, dequantize_q6_K>;
+
 kernel void kernel_offload_fence(
         constant ggml_metal_kargs_offload & args,
         volatile coherent(system) device uint * fence) {

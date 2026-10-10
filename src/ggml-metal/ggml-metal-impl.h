@@ -521,6 +521,13 @@ typedef struct {
 } ggml_metal_kargs_mul_mm_deq;
 
 typedef struct {
+    int32_t  nch;
+    uint64_t nb01;
+    uint64_t w_stride;
+    uint64_t total;
+} ggml_metal_kargs_offload_deq_w;
+
+typedef struct {
     int32_t  ne10;
     int32_t  ne11;
     int32_t  ne12;

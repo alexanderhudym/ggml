@@ -25,6 +25,9 @@ struct ggml_metal_offload_plan {
     size_t  out_stride;
 
     void *  call;
+
+    void *  w;
+    size_t  w_stride;
 };
 
 typedef bool (*ggml_metal_offload_match_t)(void * user, const char * name, int64_t K, int64_t N, int64_t M, struct ggml_metal_offload_plan * plan);

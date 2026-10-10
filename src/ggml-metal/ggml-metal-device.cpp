@@ -880,6 +880,19 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_offload_center(g
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_offload_deq_w(ggml_metal_library_t lib, ggml_type type) {
+    char base[256];
+
+    snprintf(base, 256, "kernel_offload_deq_w_%s", ggml_type_name(type));
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, base);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, base, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm64(ggml_metal_library_t lib, const ggml_tensor * op, bool bias) {
     char base[256];
     char name[256];
