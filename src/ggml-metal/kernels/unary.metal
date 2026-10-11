@@ -285,6 +285,29 @@ typedef decltype(kernel_swiglu<float>) kernel_swiglu_t;
 template [[host_name("kernel_swiglu_f32")]] kernel kernel_swiglu_t kernel_swiglu<float>;
 template [[host_name("kernel_swiglu_f16")]] kernel kernel_swiglu_t kernel_swiglu<half>;
 
+kernel void kernel_swiglu_scale_f32(
+        constant ggml_metal_kargs_glu & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint tgpig[[threadgroup_position_in_grid]],
+        uint tpitg[[thread_position_in_threadgroup]],
+        uint   ntg[[threads_per_threadgroup]]) {
+    device const float * src0_row = (device const float *) ((device const char *) src0 + tgpig*args.nb01) + args.i00;
+    device const float * src1_row = (device const float *) ((device const char *) src1 + tgpig*args.nb11) + args.i10;
+    device       float * dst_row  = (device       float *) ((device       char *) dst  + tgpig*args.nb1);
+
+    for (int i0 = tpitg; i0 < args.ne0; i0 += ntg) {
+        const float x0 = src0_row[i0];
+        const float x1 = src1_row[i0];
+
+        const float silu = x0 / (1.0f + exp(-x0));
+        const float p    = silu*x1;
+
+        dst_row[i0] = fma(args.scale, p, args.bias);
+    }
+}
+
 template<typename T>
 kernel void kernel_swiglu_oai(
         constant ggml_metal_kargs_glu & args,
@@ -398,3 +421,25 @@ typedef decltype(kernel_geglu_quick<float>) kernel_geglu_quick_t;
 
 template [[host_name("kernel_geglu_quick_f32")]] kernel kernel_geglu_quick_t kernel_geglu_quick<float>;
 template [[host_name("kernel_geglu_quick_f16")]] kernel kernel_geglu_quick_t kernel_geglu_quick<half>;
+
+kernel void kernel_sigmoid_mul_f32_4(
+        constant ggml_metal_kargs_sigmoid_mul & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    using T = float4;
+
+    device const float4 * xr = (device const float4 *) (src0 + tgpig.x*args.nb01 + tgpig.y*args.nb02 + tgpig.z*args.nb03);
+    device const float4 * br = (device const float4 *) (src1 + tgpig.x*args.nb11 + tgpig.y*args.nb12 + tgpig.z*args.nb13);
+    device       float4 * dr = (device       float4 *) (dst  + tgpig.x*args.nb1  + tgpig.y*args.nb2  + tgpig.z*args.nb3);
+
+    for (int i0 = tpitg.x; i0 < args.ne0; i0 += ntg.x) {
+        const float4 x = br[i0];
+        const float4 s = (T) (1 / (1 + exp(-x)));
+
+        dr[i0] = args.x_first ? xr[i0]*s : s*xr[i0];
+    }
+}

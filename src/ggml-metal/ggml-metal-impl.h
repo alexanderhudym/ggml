@@ -868,7 +868,43 @@ typedef struct{
     int32_t  i10;
     float    alpha;
     float    limit;
+    float    scale;
+    float    bias;
 } ggml_metal_kargs_glu;
+
+typedef struct {
+    int32_t  ne0;
+    int32_t  ne11;
+    int32_t  ne12;
+    int32_t  ne13;
+    int32_t  m_first;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    uint64_t nb21;
+    uint64_t nb22;
+    uint64_t nb23;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+} ggml_metal_kargs_mul_add;
+
+typedef struct {
+    int32_t  ne0;
+    int32_t  x_first;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+} ggml_metal_kargs_sigmoid_mul;
 
 typedef struct {
     uint64_t np;

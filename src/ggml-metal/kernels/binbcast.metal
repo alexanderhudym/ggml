@@ -226,3 +226,29 @@ template [[host_name("kernel_repeat_bf16")]] kernel kernel_repeat_t kernel_repea
 #endif
 template [[host_name("kernel_repeat_i32")]] kernel kernel_repeat_t kernel_repeat<int>;
 template [[host_name("kernel_repeat_i16")]] kernel kernel_repeat_t kernel_repeat<short>;
+
+kernel void kernel_mul_add_f32_4(
+        constant ggml_metal_kargs_mul_add & args,
+        device const char * a,
+        device const char * g,
+        device const char * r,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+#pragma METAL fp contract(off)
+    const uint i1 = tgpig.x;
+    const uint i2 = tgpig.y;
+    const uint i3 = tgpig.z;
+
+    device const float4 * ar = (device const float4 *) (a + i1*args.nb01 + i2*args.nb02 + i3*args.nb03);
+    device const float4 * gr = (device const float4 *) (g + (i1%args.ne11)*args.nb11 + (i2%args.ne12)*args.nb12 + (i3%args.ne13)*args.nb13);
+    device const float4 * rr = (device const float4 *) (r + i1*args.nb21 + i2*args.nb22 + i3*args.nb23);
+    device       float4 * dr = (device       float4 *) (dst + i1*args.nb1 + i2*args.nb2 + i3*args.nb3);
+
+    for (int i0 = tpitg.x; i0 < args.ne0; i0 += ntg.x) {
+        const float4 m = ar[i0]*gr[i0];
+
+        dr[i0] = args.m_first ? m + rr[i0] : rr[i0] + m;
+    }
+}
